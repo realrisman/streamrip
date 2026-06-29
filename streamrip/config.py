@@ -17,7 +17,7 @@ logger = logging.getLogger("streamrip")
 APP_DIR = click.get_app_dir("streamrip")
 os.makedirs(APP_DIR, exist_ok=True)
 DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, "config.toml")
-CURRENT_CONFIG_VERSION = "2.2.0"
+CURRENT_CONFIG_VERSION = "2.2.1"
 
 
 class OutdatedConfigError(Exception):
@@ -203,6 +203,10 @@ class DownloadsConfig:
     # Verify SSL certificates for API connections
     # Set to false if you encounter SSL certificate verification errors (not recommended)
     verify_ssl: bool
+    # If a track download fails at the requested quality (e.g. the file is not
+    # available at hi-res), retry at progressively lower qualities instead of
+    # skipping the track entirely.
+    fallback_to_lower_quality: bool
 
 
 @dataclass(slots=True)

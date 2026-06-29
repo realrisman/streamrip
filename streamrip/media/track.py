@@ -17,6 +17,9 @@ from .semaphore import global_download_semaphore
 
 logger = logging.getLogger("streamrip")
 
+# Total download attempts per track (1 initial + retries) before giving up.
+MAX_DOWNLOAD_RETRIES = 3
+
 
 @dataclass(slots=True)
 class Track(Media):
@@ -27,9 +30,15 @@ class Track(Media):
     # Is None if a cover doesn't exist for the track
     cover_path: str | None
     db: Database
+    # Client + quality are kept so a failed download can be retried at a lower
+    # quality (see `download`).
+    client: Client
+    quality: int
     # change?
     download_path: str = ""
     is_single: bool = False
+    # Set when all download attempts fail; skips tagging/conversion in postprocess.
+    failed: bool = False
 
     async def preprocess(self):
         self._set_download_path()
@@ -40,41 +49,80 @@ class Track(Media):
     async def download(self):
         # TODO: progress bar description
         async with global_download_semaphore(self.config.session.downloads):
+            quality = self.quality
+            while True:
+                if await self._download_with_retries():
+                    return
+
+                # Remove the partial/truncated file from the failed attempts so
+                # it isn't tagged or left behind.
+                if os.path.exists(self.download_path):
+                    os.remove(self.download_path)
+
+                # The file may be unavailable at this quality (e.g. a hi-res
+                # master the CDN won't serve). Fall back to the next lower
+                # quality and try again, if enabled.
+                if not (
+                    self.config.session.downloads.fallback_to_lower_quality
+                    and quality > 0
+                ):
+                    break
+
+                quality -= 1
+                logger.warning(
+                    f"Could not download track '{self.meta.title}' at quality "
+                    f"{quality + 1}, falling back to quality {quality}"
+                )
+                try:
+                    self.downloadable = await self.client.get_downloadable(
+                        self.meta.info.id, quality
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"No lower quality available for track '{self.meta.title}': {e}"
+                    )
+                    break
+                # The extension can change between qualities (e.g. flac -> mp3).
+                self._set_download_path()
+
+            logger.error(
+                f"Persistent error downloading track '{self.meta.title}', skipping"
+            )
+            self.db.set_failed(self.downloadable.source, "track", self.meta.info.id)
+            self.failed = True
+
+    async def _download_with_retries(self) -> bool:
+        """Download at the current quality, retrying transient failures with
+        exponential backoff. Returns True on success, False if every attempt
+        fails."""
+        for attempt in range(MAX_DOWNLOAD_RETRIES):
+            label = f"Track {self.meta.tracknumber}"
+            if attempt > 0:
+                label += " (retry)"
             with get_progress_callback(
                 self.config.session.cli.progress_bars,
                 await self.downloadable.size(),
-                f"Track {self.meta.tracknumber}",
+                label,
             ) as callback:
                 try:
                     await self.downloadable.download(self.download_path, callback)
-                    retry = False
+                    return True
                 except Exception as e:
                     logger.error(
                         f"Error downloading track '{self.meta.title}', retrying: {e}"
                     )
-                    retry = True
-
-            if not retry:
-                return
-
-            with get_progress_callback(
-                self.config.session.cli.progress_bars,
-                await self.downloadable.size(),
-                f"Track {self.meta.tracknumber} (retry)",
-            ) as callback:
-                try:
-                    await self.downloadable.download(self.download_path, callback)
-                except Exception as e:
-                    logger.error(
-                        f"Persistent error downloading track '{self.meta.title}', skipping: {e}"
-                    )
-                    self.db.set_failed(
-                        self.downloadable.source, "track", self.meta.info.id
-                    )
+                    if attempt < MAX_DOWNLOAD_RETRIES - 1:
+                        # Exponential backoff between attempts.
+                        await asyncio.sleep(2**attempt)
+        return False
 
     async def postprocess(self):
         if self.is_single:
             remove_title(self.meta.title)
+
+        # Download failed: nothing valid on disk to tag/convert/record.
+        if self.failed:
+            return
 
         await tag_file(self.download_path, self.meta, self.cover_path)
         if self.config.session.conversion.enabled:
@@ -168,6 +216,8 @@ class PendingTrack(Pending):
             folder,
             self.cover_path,
             self.db,
+            self.client,
+            quality,
         )
 
 
@@ -245,6 +295,8 @@ class PendingSingle(Pending):
             folder,
             embedded_cover_path,
             self.db,
+            self.client,
+            quality,
             is_single=True,
         )
 

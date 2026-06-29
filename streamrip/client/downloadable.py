@@ -22,7 +22,7 @@ from Cryptodome.Cipher import AES, Blowfish
 from Cryptodome.Util import Counter
 
 from .. import converter
-from ..exceptions import NonStreamableError
+from ..exceptions import IncompleteDownloadError, NonStreamableError
 
 logger = logging.getLogger("streamrip")
 
@@ -47,19 +47,30 @@ async def fast_async_download(path, url, headers, callback):
     chunk_size: int = 2**17  # 131 KB
     counter = 0
     yield_every = 8  # 1 MB
+    written = 0
     with open(path, "wb") as file:  # noqa: ASYNC101
         with requests.get(  # noqa: ASYNC100
             url,
             headers=headers,
             allow_redirects=True,
             stream=True,
+            timeout=(10, 60),  # (connect, read) — fail fast on stalled connections
         ) as resp:
+            resp.raise_for_status()
+            expected = int(resp.headers.get("Content-Length", 0))
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 file.write(chunk)
+                written += len(chunk)
                 callback(len(chunk))
                 if counter % yield_every == 0:
                     await asyncio.sleep(0)
                 counter += 1
+
+    # Detect connections that close cleanly mid-stream (silent truncation).
+    if expected and written != expected:
+        raise IncompleteDownloadError(
+            f"Expected {expected} bytes, only received {written} from {url}"
+        )
 
 
 @dataclass(slots=True)
@@ -175,6 +186,12 @@ class DeezerDownloadable(Downloadable):
                 async for data, _ in resp.content.iter_chunks():
                     buf += data
                     callback(len(data))
+
+                if self._size and len(buf) != self._size:
+                    raise IncompleteDownloadError(
+                        f"Expected {self._size} bytes, only received {len(buf)} "
+                        f"from {self.url}"
+                    )
 
                 encrypt_chunk_size = 3 * 2048
                 async with aiofiles.open(path, "wb") as audio:

@@ -91,6 +91,8 @@ class PendingPlaylistTrack(Pending):
             self.folder,
             embedded_cover_path,
             self.db,
+            self.client,
+            quality,
         )
 
     async def _download_cover(self, covers: Covers, folder: str) -> str | None:

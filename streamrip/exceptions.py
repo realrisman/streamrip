@@ -66,5 +66,13 @@ class NonStreamableError(Exception):
         return " ".join(base_msg)
 
 
+class IncompleteDownloadError(Exception):
+    """Raised when a download finishes with fewer bytes than expected.
+
+    Typically caused by the server closing the connection mid-stream
+    (e.g. ``IncompleteRead``). Retryable.
+    """
+
+
 class ConversionError(Exception):
     """ConversionError."""
