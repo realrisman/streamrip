@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .. import progress
 from ..client import Client
@@ -26,6 +26,11 @@ class Album(Media):
     # folder where the tracks will be downloaded
     folder: str
     db: Database
+    # Maps track id -> final on-disk path for each track written during this
+    # run. Lets callers (e.g. playlist m3u generation) reference the exact file
+    # the download produced instead of re-discovering it by globbing. Tracks
+    # skipped (already in the database) are absent and located by other means.
+    track_paths: dict[str, str] = field(default_factory=dict)
 
     async def preprocess(self):
         progress.add_title(self.meta.album)
@@ -37,6 +42,8 @@ class Album(Media):
                 if track is None:
                     return
                 await track.rip()
+                if not track.failed:
+                    self.track_paths[str(track.meta.info.id)] = track.download_path
             except Exception as e:
                 logger.error(f"Error downloading track: {e}")
 
