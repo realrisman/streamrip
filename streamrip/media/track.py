@@ -21,6 +21,23 @@ logger = logging.getLogger("streamrip")
 MAX_DOWNLOAD_RETRIES = 3
 
 
+def format_track_filename(meta: TrackMetadata, config: Config) -> str:
+    """Return the cleaned, truncated track filename (without extension).
+
+    This is the single source of truth for a track's on-disk filename stem so
+    that callers which need to locate a downloaded file (e.g. playlist m3u
+    generation) stay in sync with what ``Track`` actually writes.
+    """
+    c = config.session.filepaths
+    name = clean_filename(
+        meta.format_track_path(c.track_format),
+        restrict=c.restrict_characters,
+    )
+    if c.truncate_to > 0 and len(name) > c.truncate_to:
+        name = name[: c.truncate_to]
+    return name
+
+
 @dataclass(slots=True)
 class Track(Media):
     meta: TrackMetadata
@@ -143,15 +160,7 @@ class Track(Media):
         self.download_path = engine.final_fn  # because the extension changed
 
     def _set_download_path(self):
-        c = self.config.session.filepaths
-        formatter = c.track_format
-        track_path = clean_filename(
-            self.meta.format_track_path(formatter),
-            restrict=c.restrict_characters,
-        )
-        if c.truncate_to > 0 and len(track_path) > c.truncate_to:
-            track_path = track_path[: c.truncate_to]
-
+        track_path = format_track_filename(self.meta, self.config)
         self.download_path = os.path.join(
             self.folder,
             f"{track_path}.{self.downloadable.extension}",

@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import html
 import logging
 import os
@@ -19,17 +20,32 @@ from ..exceptions import NonStreamableError
 from ..filepath_utils import clean_filepath
 from ..metadata import (
     AlbumMetadata,
-    Covers,
     PlaylistMetadata,
     SearchResults,
     TrackMetadata,
 )
 from ..utils.ssl_utils import get_aiohttp_connector_kwargs
-from .artwork import download_artwork
+from .album import Album, PendingAlbum
 from .media import Media, Pending
-from .track import Track
+from .track import format_track_filename
 
 logger = logging.getLogger("streamrip")
+
+
+@dataclass(slots=True)
+class PlaylistTrackInfo:
+    """Resolved metadata for one playlist entry.
+
+    Records which album backs the track and the metadata needed to locate the
+    track's file on disk once the album has been downloaded.
+    """
+
+    position: int
+    track_id: str
+    client: Client
+    album_id: str
+    album_meta: AlbumMetadata
+    track_meta: TrackMetadata
 
 
 @dataclass(slots=True)
@@ -37,15 +53,15 @@ class PendingPlaylistTrack(Pending):
     id: str
     client: Client
     config: Config
-    folder: str
     playlist_name: str
     position: int
     db: Database
 
-    async def resolve(self) -> Track | None:
-        if self.db.downloaded(self.id):
-            logger.info(f"Track ({self.id}) already logged in database. Skipping.")
-            return None
+    async def resolve(self) -> PlaylistTrackInfo | None:
+        # NOTE: the database is intentionally *not* consulted here. We still
+        # want a playlist (m3u) entry for tracks that were downloaded on a
+        # previous run; the per-track skip happens later when the album is
+        # downloaded.
         try:
             resp = await self.client.get_metadata(self.id, "track")
         except NonStreamableError as e:
@@ -67,43 +83,14 @@ class PendingPlaylistTrack(Pending):
             self.db.set_failed(self.client.source, "track", self.id)
             return None
 
-        c = self.config.session.metadata
-        if c.renumber_playlist_tracks:
-            meta.tracknumber = self.position
-        if c.set_playlist_to_album:
-            album.album = self.playlist_name
-
-        quality = self.config.session.get_source(self.client.source).quality
-        try:
-            embedded_cover_path, downloadable = await asyncio.gather(
-                self._download_cover(album.covers, self.folder),
-                self.client.get_downloadable(self.id, quality),
-            )
-        except NonStreamableError as e:
-            logger.error(f"Error fetching download info for track {self.id}: {e}")
-            self.db.set_failed(self.client.source, "track", self.id)
-            return None
-
-        return Track(
-            meta,
-            downloadable,
-            self.config,
-            self.folder,
-            embedded_cover_path,
-            self.db,
-            self.client,
-            quality,
+        return PlaylistTrackInfo(
+            position=self.position,
+            track_id=self.id,
+            client=self.client,
+            album_id=album.info.id,
+            album_meta=album,
+            track_meta=meta,
         )
-
-    async def _download_cover(self, covers: Covers, folder: str) -> str | None:
-        embed_path, _ = await download_artwork(
-            self.client.session,
-            folder,
-            covers,
-            self.config.session.artwork,
-            for_playlist=True,
-        )
-        return embed_path
 
 
 @dataclass(slots=True)
@@ -120,28 +107,120 @@ class Playlist(Media):
         progress.remove_title(self.name)
 
     async def download(self):
-        track_resolve_chunk_size = 20
+        # Phase A: resolve each playlist entry's album + track metadata.
+        infos = await self._resolve_track_infos()
+        if not infos:
+            logger.error(f"No tracks could be resolved for playlist '{self.name}'")
+            return
 
-        async def _resolve_download(item: PendingPlaylistTrack):
-            try:
-                track = await item.resolve()
-                if track is None:
-                    return
-                await track.rip()
-            except Exception as e:
-                logger.error(f"Error downloading track: {e}")
+        # Phase B: download each distinct album once (full album).
+        resolved_albums = await self._download_albums(infos)
 
-        batches = self.batch(
-            [_resolve_download(track) for track in self.tracks],
-            track_resolve_chunk_size,
-        )
+        # Phase C: write an m3u that references the tracks inside their album
+        # folders (which live outside the `playlist` folder).
+        self._write_m3u(infos, resolved_albums)
 
-        for batch in batches:
-            results = await asyncio.gather(*batch, return_exceptions=True)
-
+    async def _resolve_track_infos(self) -> list[PlaylistTrackInfo]:
+        chunk_size = 20
+        infos: list[PlaylistTrackInfo] = []
+        for batch in self.batch(self.tracks, chunk_size):
+            results = await asyncio.gather(
+                *[item.resolve() for item in batch],
+                return_exceptions=True,
+            )
             for result in results:
                 if isinstance(result, Exception):
-                    logger.error(f"Batch processing error: {result}")
+                    logger.error(f"Error resolving playlist track: {result}")
+                elif result is not None:
+                    infos.append(result)
+        infos.sort(key=lambda i: i.position)
+        return infos
+
+    async def _download_albums(
+        self,
+        infos: list[PlaylistTrackInfo],
+    ) -> dict[str, Album]:
+        # Dedupe album ids, keeping the first client seen for each album.
+        unique: dict[str, Client] = {}
+        for info in infos:
+            unique.setdefault(info.album_id, info.client)
+
+        resolved: dict[str, Album] = {}
+        album_chunk_size = 5
+        for batch in self.batch(list(unique.items()), album_chunk_size):
+            results = await asyncio.gather(
+                *[
+                    self._resolve_and_download_album(album_id, client)
+                    for album_id, client in batch
+                ],
+                return_exceptions=True,
+            )
+            for (album_id, _), result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error downloading album {album_id}: {result}")
+                elif result is not None:
+                    resolved[album_id] = result
+        return resolved
+
+    async def _resolve_and_download_album(
+        self,
+        album_id: str,
+        client: Client,
+    ) -> Album | None:
+        pending = PendingAlbum(album_id, client, self.config, self.db)
+        album = await pending.resolve()
+        if album is None:
+            return None
+        await album.rip()
+        return album
+
+    def _write_m3u(
+        self,
+        infos: list[PlaylistTrackInfo],
+        resolved_albums: dict[str, Album],
+    ):
+        downloads_config = self.config.session.downloads
+        playlist_folder = os.path.join(downloads_config.folder, "playlist")
+        os.makedirs(playlist_folder, exist_ok=True)
+        m3u_path = os.path.join(playlist_folder, clean_filepath(self.name) + ".m3u")
+
+        lines = ["#EXTM3U"]
+        for info in infos:
+            album = resolved_albums.get(info.album_id)
+            if album is None:
+                logger.warning(
+                    f"Album for track '{info.track_meta.title}' was not downloaded; "
+                    "omitting from playlist file",
+                )
+                continue
+
+            expected_dir = album.folder
+            if downloads_config.disc_subdirectories and info.album_meta.disctotal > 1:
+                expected_dir = os.path.join(
+                    expected_dir,
+                    f"Disc {info.track_meta.discnumber}",
+                )
+
+            stem = format_track_filename(info.track_meta, self.config)
+            pattern = os.path.join(glob.escape(expected_dir), glob.escape(stem) + ".*")
+            matches = glob.glob(pattern)
+            if not matches:
+                logger.warning(
+                    f"Could not locate downloaded file for '{info.track_meta.title}'; "
+                    "omitting from playlist file",
+                )
+                continue
+
+            rel_path = os.path.relpath(matches[0], start=playlist_folder)
+            lines.append(
+                f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}",
+            )
+            lines.append(rel_path)
+
+        with open(m3u_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        logger.info(f"Wrote playlist file to {m3u_path}")
+        console.print(f"[green]Wrote playlist file to[/green] {m3u_path}")
 
     @staticmethod
     def batch(iterable, n=1):
@@ -172,14 +251,11 @@ class PendingPlaylist(Pending):
             logger.error(f"Error creating playlist: {e}")
             return None
         name = meta.name
-        parent = self.config.session.downloads.folder
-        folder = os.path.join(parent, clean_filepath(name))
         tracks = [
             PendingPlaylistTrack(
                 id,
                 self.client,
                 self.config,
-                folder,
                 name,
                 position + 1,
                 self.db,
@@ -244,9 +320,6 @@ class PendingLastfmPlaylist(Pending):
                 requests.append(self._make_query(f"{title} {artist}", s, callback))
             results: list[tuple[str | None, bool]] = await asyncio.gather(*requests)
 
-        parent = self.config.session.downloads.folder
-        folder = os.path.join(parent, clean_filepath(playlist_title))
-
         pending_tracks = []
         for pos, (id, from_fallback) in enumerate(results, start=1):
             if id is None:
@@ -264,7 +337,6 @@ class PendingLastfmPlaylist(Pending):
                     id,
                     client,
                     self.config,
-                    folder,
                     playlist_title,
                     pos,
                     self.db,
