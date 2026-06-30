@@ -69,8 +69,21 @@ def _make_album(folder, *, disctotal=1, track_paths=None):
     return album
 
 
-def _playlist(name, config):
-    return Playlist(name, config, MagicMock(), [], MagicMock())
+def _playlist(name, config, db=None):
+    if db is None:
+        # Default: no recorded paths, so locators fall through to the on-disk
+        # glob (the legacy path exercised by most tests). Pass a db with
+        # `path_for` set to exercise the DB-lookup tier.
+        db = MagicMock()
+        db.path_for.return_value = None
+    return Playlist(name, config, MagicMock(), [], db)
+
+
+def _db_with_paths(paths):
+    """A db stand-in whose `path_for(track_id)` returns `paths[track_id]`."""
+    db = MagicMock()
+    db.path_for.side_effect = lambda track_id: paths.get(track_id)
+    return db
 
 
 def test_format_track_filename_truncates():
@@ -283,6 +296,100 @@ def test_locate_album_files_namespaces_album_id_by_source(tmp_path):
     assert located == {1: album_q.track_paths["tq"], 2: album_t.track_paths["tt"]}
 
 
+# --- DB path persistence (Fix A/B) -------------------------------------------
+
+
+def test_locate_album_file_uses_db_path_for_skipped_track(tmp_path):
+    """A track skipped this run (absent from track_paths) is located via the
+    exact path a previous run recorded in the DB, without reconstructing or
+    globbing the album folder."""
+    config = _make_config(tmp_path)
+
+    # The recorded file lives somewhere the folder reconstruction would never
+    # guess, proving the DB path — not a glob — was used.
+    recorded = os.path.join(str(tmp_path), "Whatever", "track.flac")
+    os.makedirs(os.path.dirname(recorded))
+    open(recorded, "w").close()
+
+    album = _make_album(os.path.join(str(tmp_path), "Album One"))  # empty/no glob hit
+    info = _make_info(
+        "A1", "01 - First", artist="A", title="First",
+        track_id="t1", position=1, album_dir="Album One",
+    )
+    db = _db_with_paths({"t1": recorded})
+
+    located = _playlist("Mix", config, db)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: recorded}
+
+
+def test_locate_album_file_db_path_used_when_album_unresolved(tmp_path):
+    """Finding 2 regression: when the album failed to re-resolve this run, the
+    recorded DB path is used instead of reconstructing the folder from the
+    track-endpoint metadata (which is wrong for e.g. Deezer)."""
+    config = _make_config(tmp_path)
+
+    recorded = os.path.join(str(tmp_path), "Real Folder", "05 - Deep.flac")
+    os.makedirs(os.path.dirname(recorded))
+    open(recorded, "w").close()
+
+    info = _make_info(
+        "A1", "05 - Deep", artist="A", title="Deep",
+        track_id="t1", position=1, source="deezer", album_dir="Reconstructed Wrong",
+    )
+    db = _db_with_paths({"t1": recorded})
+
+    # resolved_albums empty -> album unresolved this run -> reconstruction path.
+    located = _playlist("Mix", config, db)._locate_album_files([info], {})
+
+    assert located == {1: recorded}
+
+
+def test_locate_single_file_uses_db_path_for_album_backed_track(tmp_path):
+    """Finding 3 regression: an album-backed track that fell through to the
+    single path but physically lives in its album folder is found via the
+    recorded DB path, not the (wrong) singles-folder glob."""
+    config = _make_config(tmp_path)
+
+    album_file = os.path.join(str(tmp_path), "Real Album", "01 - Song.flac")
+    os.makedirs(os.path.dirname(album_file))
+    open(album_file, "w").close()
+
+    info = _make_info(
+        "A1", "01 - Song", artist="A", title="Song", track_id="t1", position=1,
+    )
+    db = _db_with_paths({"t1": album_file})
+
+    # resolved_singles empty (skipped this run); the singles-folder glob would
+    # miss because the file is in the album folder.
+    assert _playlist("Mix", config, db)._locate_single_file(info, {}) == album_file
+
+
+def test_locate_album_file_falls_back_to_glob_when_db_path_missing(tmp_path):
+    """A recorded DB path that no longer exists on disk is ignored; the locator
+    falls back to globbing the album folder (legacy behavior)."""
+    config = _make_config(tmp_path)
+
+    album_dir = os.path.join(str(tmp_path), "Album One")
+    os.makedirs(album_dir)
+    open(os.path.join(album_dir, "01 - First.mp3"), "w").close()
+
+    album = _make_album(album_dir)
+    info = _make_info(
+        "A1", "01 - First", artist="A", title="First",
+        track_id="t1", position=1, album_dir="Album One",
+    )
+    db = _db_with_paths({"t1": os.path.join(str(tmp_path), "gone", "x.flac")})
+
+    located = _playlist("Mix", config, db)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: os.path.join(album_dir, "01 - First.mp3")}
+
+
 # --- _write_m3u --------------------------------------------------------------
 
 
@@ -467,21 +574,25 @@ def test_write_m3u_does_not_clobber_existing_file_when_nothing_located(tmp_path)
 
 def test_write_m3u_does_not_shrink_existing_file_on_partial_run(tmp_path):
     """A degraded re-run that locates fewer tracks than the existing m3u already
-    holds must keep the existing (more complete) file rather than truncating
-    it."""
+    holds must not drop the previously-referenced tracks: the result merges this
+    run's located entries with the existing ones (deduped by path)."""
     config = _make_config(tmp_path)
 
     playlist_folder = os.path.join(str(tmp_path), "playlist")
     os.makedirs(playlist_folder)
     m3u_path = os.path.join(playlist_folder, "Mix.m3u")
-    good_contents = (
-        "#EXTM3U\n"
-        "#EXTINF:-1,Artist A - First\n../Album One/01.flac\n"
-        "#EXTINF:-1,Artist B - Second\n../Album Two/02.flac\n"
-        "#EXTINF:-1,Artist C - Third\n../Album Three/03.flac\n"
-    )
+    # Existing paths match what the locator produces, so the re-located track 1
+    # dedupes against its existing entry instead of duplicating.
     with open(m3u_path, "w", encoding="utf-8") as f:
-        f.write(good_contents)
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Artist A - First\n"
+            + os.path.join("..", "Album One", "01 - First.flac") + "\n"
+            "#EXTINF:-1,Artist B - Second\n"
+            + os.path.join("..", "Album Two", "02 - Second.flac") + "\n"
+            "#EXTINF:-1,Artist C - Third\n"
+            + os.path.join("..", "Album Three", "03 - Third.flac") + "\n"
+        )
 
     # Only one of three tracks could be located this run.
     f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
@@ -493,44 +604,59 @@ def test_write_m3u_does_not_shrink_existing_file_on_partial_run(tmp_path):
     _playlist("Mix", config)._write_m3u(infos, {1: f1}, {})
 
     with open(m3u_path, encoding="utf-8") as f:
-        assert f.read() == good_contents
-
-
-def test_write_m3u_overwrites_when_not_shrinking(tmp_path):
-    """When the new run locates at least as many tracks as the existing file,
-    the m3u is rewritten (growth/refresh is allowed)."""
-    config = _make_config(tmp_path)
-
-    playlist_folder = os.path.join(str(tmp_path), "playlist")
-    os.makedirs(playlist_folder)
-    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
-    with open(m3u_path, "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n#EXTINF:-1,Old - Only\n../Old/01.flac\n")
-
-    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
-    f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.mp3")
-    infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
-    ]
-    _playlist("Mix", config)._write_m3u(infos, {1: f1, 2: f2}, {})
-
-    with open(m3u_path, encoding="utf-8") as f:
         content = f.read()
 
+    # Track 1 (this run) first, then tracks 2 & 3 preserved from the old file —
+    # nothing lost, nothing duplicated.
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
         os.path.join("..", "Album One", "01 - First.flac"),
         "#EXTINF:-1,Artist B - Second",
-        os.path.join("..", "Album Two", "02 - Second.mp3"),
+        os.path.join("..", "Album Two", "02 - Second.flac"),
+        "#EXTINF:-1,Artist C - Third",
+        os.path.join("..", "Album Three", "03 - Third.flac"),
     ]
+
+
+def test_write_m3u_adds_new_tracks_during_degraded_run(tmp_path):
+    """Regression (finding 1): a newly-added track that downloaded successfully
+    this run must appear in the m3u even when the run is degraded (some old
+    tracks couldn't be re-located). The old all-or-nothing skip dropped it."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    # Two tracks referenced previously; neither is re-located this run.
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Old A - One\n../Old A/01.flac\n"
+            "#EXTINF:-1,Old B - Two\n../Old B/02.flac\n"
+        )
+
+    # This run locates only the brand-new track (the two old albums failed).
+    new_file = os.path.join(str(tmp_path), "New Album", "01 - Fresh.flac")
+    info = _make_info(
+        "A9", "01 - Fresh", artist="New", title="Fresh", position=3, track_id="t9"
+    )
+    _playlist("Mix", config)._write_m3u([info], {3: new_file}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # The new track is written, and the two previously-referenced tracks survive.
+    assert os.path.join("..", "New Album", "01 - Fresh.flac") in content
+    assert "../Old A/01.flac" in content
+    assert "../Old B/02.flac" in content
 
 
 def test_write_m3u_handles_non_utf8_existing_file(tmp_path):
     """Reading an existing m3u that isn't UTF-8 (e.g. written by another tool)
     must not raise UnicodeDecodeError and abort the write after albums have
-    already downloaded."""
+    already downloaded. The foreign bytes of carried-over entries are preserved
+    byte-for-byte (surrogateescape round-trip) rather than corrupted."""
     config = _make_config(tmp_path)
 
     playlist_folder = os.path.join(str(tmp_path), "playlist")
@@ -543,15 +669,20 @@ def test_write_m3u_handles_non_utf8_existing_file(tmp_path):
             "#EXTINF:-1,Sigur Rós - Two\n../B/02.flac\n".encode("latin-1")
         )
 
-    # Only one track locates this run -> never-shrink keeps the existing file.
+    # One track locates this run; the existing (non-UTF-8) entries are merged in.
     f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
     info = _make_info("A1", "01 - First", artist="A", title="First", position=1)
 
-    # Must not raise; existing (2 entries) > located (1) -> keep existing.
+    # Must not raise; the located track and the preserved old entries coexist.
     _playlist("Mix", config)._write_m3u([info], {1: f1}, {})
 
     with open(m3u_path, "rb") as f:
-        assert "Beyoncé".encode("latin-1") in f.read()
+        raw = f.read()
+    # New track present, both old paths preserved, foreign bytes intact.
+    assert os.path.join("..", "Album One", "01 - First.flac").encode() in raw
+    assert b"../A/01.flac" in raw
+    assert b"../B/02.flac" in raw
+    assert "Beyoncé".encode("latin-1") in raw
 
 
 # --- helpers -----------------------------------------------------------------

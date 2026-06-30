@@ -250,7 +250,9 @@ class Playlist(Media):
         os.makedirs(playlist_folder, exist_ok=True)
         m3u_path = os.path.join(playlist_folder, clean_filename(self.name) + ".m3u")
 
-        lines = ["#EXTM3U"]
+        # (#EXTINF, relative-path) pairs for the tracks located this run, in
+        # playlist order.
+        entries: list[tuple[str, str]] = []
         for info in infos:
             track_file = album_files.get(info.position)
             if track_file is None:
@@ -263,35 +265,41 @@ class Playlist(Media):
                 continue
 
             rel_path = os.path.relpath(track_file, start=playlist_folder)
-            lines.append(
-                f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}",
-            )
-            lines.append(rel_path)
+            extinf = f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}"
+            entries.append((extinf, rel_path))
 
         # Don't clobber a previously-good playlist with a header-only stub when
         # nothing could be located this run (e.g. a transient all-fail re-run).
-        located = sum(1 for ln in lines if ln.startswith("#EXTINF"))
-        if located == 0:
+        if not entries:
             logger.warning(
                 f"No tracks could be located for playlist '{self.name}'; "
                 "leaving any existing playlist file untouched",
             )
             return
 
-        # Never auto-shrink: a degraded re-run (some albums failed to re-resolve
-        # and the on-disk glob missed) must not overwrite a more-complete m3u
-        # with fewer entries. The user can delete the file to force a rebuild
-        # after intentionally removing tracks.
-        existing = self._existing_m3u_entry_count(m3u_path)
-        if existing > located:
-            logger.warning(
-                f"Located fewer tracks ({located}) than the existing playlist "
-                f"file ({existing}) for '{self.name}'; keeping the existing "
-                "file. Delete it to force a rebuild.",
-            )
-            return
+        # Never lose previously-referenced tracks. Merge this run's entries (in
+        # playlist order) with any entry already in the file whose path we did
+        # not re-locate this run, deduped by relative path. A degraded re-run
+        # (an album failed to re-resolve and the on-disk glob missed) thus keeps
+        # the old entry instead of dropping it, while newly-downloaded tracks
+        # are always added — without the old all-or-nothing skip that dropped
+        # new tracks too. Delete the file to force a rebuild after intentionally
+        # removing tracks.
+        seen = {rel for _, rel in entries}
+        for extinf, rel in self._existing_m3u_entries(m3u_path):
+            if rel not in seen:
+                seen.add(rel)
+                entries.append((extinf, rel))
 
-        with open(m3u_path, "w", encoding="utf-8") as f:
+        lines = ["#EXTM3U"]
+        for extinf, rel in entries:
+            lines.append(extinf)
+            lines.append(rel)
+
+        # surrogateescape: entries carried over from an existing m3u written by
+        # another tool may hold non-UTF-8 bytes (round-tripped as surrogates by
+        # `_existing_m3u_entries`); re-emit them byte-for-byte instead of raising.
+        with open(m3u_path, "w", encoding="utf-8", errors="surrogateescape") as f:
             f.write("\n".join(lines) + "\n")
         logger.info(f"Wrote playlist file to {m3u_path}")
         console.print(f"[green]Wrote playlist file to[/green] {m3u_path}")
@@ -315,6 +323,21 @@ class Playlist(Media):
                 located[info.position] = path
         return located
 
+    def _db_located(self, info: PlaylistTrackInfo) -> str | None:
+        """Return the on-disk path a previous run recorded for this entry.
+
+        Authoritative for any track downloaded after path-persistence shipped:
+        it sidesteps folder reconstruction entirely (correct regardless of
+        source quirks like Deezer's incomplete track-endpoint album metadata,
+        and regardless of which folder — album or singles — the file lives in).
+        Returns None for legacy entries with no recorded path, or if the
+        recorded file no longer exists, so the caller falls back to globbing.
+        """
+        path = self.db.path_for(info.track_id)
+        if path is not None and os.path.exists(path):
+            return path
+        return None
+
     def _locate_album_file(
         self,
         info: PlaylistTrackInfo,
@@ -331,7 +354,13 @@ class Playlist(Media):
             if path is not None:
                 return path
 
-            # The track was skipped this run (already in the database) but the
+            # The track was skipped this run (already in the database); prefer
+            # the path a previous run recorded over reconstructing the folder.
+            db_path = self._db_located(info)
+            if db_path is not None:
+                return db_path
+
+            # No recorded path (downloaded before path-persistence) but the
             # album still re-resolved, so glob the album's own folder by filename
             # stem. Use the album object's folder and metadata — the album-
             # endpoint truth the writer actually used — rather than reconstructing
@@ -352,10 +381,15 @@ class Playlist(Media):
             )
 
         # The album failed to (re)resolve this run, but the file may exist from a
-        # prior run. Best-effort reconstruct the folder from the track-embedded
-        # album metadata (which may understate `disctotal` / custom formats); on
-        # a miss the track falls back to a single download rather than a wrong
-        # reference.
+        # prior run. A recorded path is exact; prefer it over reconstruction.
+        db_path = self._db_located(info)
+        if db_path is not None:
+            return db_path
+
+        # No recorded path (legacy entry). Best-effort reconstruct the folder
+        # from the track-embedded album metadata (which may understate
+        # `disctotal` / custom formats); on a miss the track falls back to a
+        # single download rather than a wrong reference.
         folder = album_folder(self.config, info.client.source, info.album_meta)
         folder = disc_subfolder(folder, self.config, info.album_meta, info.track_meta)
         return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
@@ -375,25 +409,49 @@ class Playlist(Media):
             # glob below, which won't match the deleted file.
             return track.download_path
 
-        # The single was skipped this run (already in the database). Glob its
-        # destination folder so the m3u still references the existing file.
+        # The track was skipped this run (already in the database). A recorded
+        # path is exact and — unlike the singles-folder glob below — also finds
+        # a track that physically lives in an album folder (e.g. an album-backed
+        # entry whose album locator missed and fell through to here).
+        db_path = self._db_located(info)
+        if db_path is not None:
+            return db_path
+
+        # No recorded path (legacy entry). Glob the singles destination folder so
+        # the m3u still references the existing file.
         folder = singles_folder(self.config, info.client.source, info.album_meta)
         return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
 
     @staticmethod
-    def _existing_m3u_entry_count(m3u_path: str) -> int:
-        """Number of `#EXTINF` track entries in an existing m3u (0 if absent)."""
+    def _existing_m3u_entries(m3u_path: str) -> list[tuple[str, str]]:
+        """Parse `(#EXTINF, path)` pairs from an existing m3u (empty if absent).
+
+        Each path line is paired with the most recent preceding `#EXTINF` line
+        (a synthesized one if a path appears without it). Used to preserve
+        previously-referenced tracks across a degraded re-run.
+        """
         if not os.path.exists(m3u_path):
-            return 0
+            return []
         try:
-            # errors="replace": an existing m3u written by another tool may not
-            # be UTF-8; a decode error here must not abort the whole write. The
-            # `#EXTINF` marker is ASCII, so counting is unaffected.
-            with open(m3u_path, encoding="utf-8", errors="replace") as f:
-                return sum(1 for line in f if line.startswith("#EXTINF"))
+            # surrogateescape: an existing m3u written by another tool may not be
+            # UTF-8; a decode error here must not abort the whole write. Foreign
+            # bytes round-trip as surrogates and are re-emitted byte-for-byte by
+            # the writer, so carried-over entries keep their original labels.
+            with open(m3u_path, encoding="utf-8", errors="surrogateescape") as f:
+                raw = [line.rstrip("\n") for line in f]
         except OSError as e:
             logger.warning(f"Could not read existing playlist file {m3u_path}: {e}")
-            return 0
+            return []
+
+        entries: list[tuple[str, str]] = []
+        pending_extinf: str | None = None
+        for line in raw:
+            if line.startswith("#EXTINF"):
+                pending_extinf = line
+            elif line and not line.startswith("#"):
+                entries.append((pending_extinf or "#EXTINF:-1,", line))
+                pending_extinf = None
+        return entries
 
     @staticmethod
     def _glob_stem(folder: str, stem: str) -> str | None:
