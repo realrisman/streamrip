@@ -27,8 +27,21 @@ def _make_config(
     return config
 
 
-def _make_info(album_id, stem, *, artist, title, disctotal=1, discnumber=1, track_id="t"):
+def _make_info(
+    album_id,
+    stem,
+    *,
+    artist,
+    title,
+    position=1,
+    disctotal=1,
+    discnumber=1,
+    track_id="t",
+    source="qobuz",
+):
     info = MagicMock()
+    info.position = position
+    info.client.source = source
     info.album_id = album_id
     info.track_id = track_id
     info.album_meta.disctotal = disctotal
@@ -37,6 +50,10 @@ def _make_info(album_id, stem, *, artist, title, disctotal=1, discnumber=1, trac
     info.track_meta.title = title
     info.track_meta.discnumber = discnumber
     return info
+
+
+def _playlist(name, config):
+    return Playlist(name, config, MagicMock(), [], MagicMock())
 
 
 def test_format_track_filename_truncates():
@@ -50,26 +67,144 @@ def test_format_track_filename_truncates():
     assert format_track_filename(meta, config) == "A very lon"
 
 
+# --- _locate_album_files -----------------------------------------------------
+
+
+def test_locate_album_files_prefers_exact_recorded_path(tmp_path):
+    """A track downloaded this run is located via the album's recorded
+    track_paths (the exact file written), independent of track_format."""
+    config = _make_config(tmp_path)
+
+    album = MagicMock(
+        folder=os.path.join(str(tmp_path), "Album One"),
+        track_paths={"42": os.path.join(str(tmp_path), "Album One", "anything.flac")},
+    )
+    info = _make_info(
+        "A1", "ignored stem", artist="Artist", title="First",
+        track_id="42", position=1,
+    )
+
+    located = _playlist("Mix", config)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: album.track_paths["42"]}
+
+
+def test_locate_album_files_index_fallback_globs_by_stem(tmp_path):
+    """A track skipped this run (not in track_paths) is found by indexing the
+    album folder and matching the filename stem, across a changed extension."""
+    config = _make_config(tmp_path)
+
+    album = MagicMock(
+        folder=os.path.join(str(tmp_path), "Album One"), track_paths={}
+    )
+    os.makedirs(album.folder)
+    # Extension differs from any assumption to prove stem-based matching.
+    open(os.path.join(album.folder, "01 - First.mp3"), "w").close()
+
+    info = _make_info("A1", "01 - First", artist="Artist", title="First", position=1)
+
+    located = _playlist("Mix", config)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: os.path.join(album.folder, "01 - First.mp3")}
+
+
+def test_locate_album_files_honors_disc_subdirectories(tmp_path):
+    config = _make_config(tmp_path, disc_subdirectories=True)
+
+    album = MagicMock(
+        folder=os.path.join(str(tmp_path), "Multi Disc"), track_paths={}
+    )
+    disc2 = os.path.join(album.folder, "Disc 2")
+    os.makedirs(disc2)
+    open(os.path.join(disc2, "05 - Deep Cut.flac"), "w").close()
+
+    info = _make_info(
+        "A1", "05 - Deep Cut", artist="Artist", title="Deep Cut",
+        disctotal=2, discnumber=2, position=1,
+    )
+
+    located = _playlist("Discs", config)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: os.path.join(disc2, "05 - Deep Cut.flac")}
+
+
+def test_locate_album_files_omits_missing_album_and_missing_file(tmp_path):
+    """Tracks whose album never downloaded, or whose file is absent inside a
+    downloaded album (failed track), are omitted so they fall back to singles."""
+    config = _make_config(tmp_path)
+
+    album1 = MagicMock(
+        folder=os.path.join(str(tmp_path), "Album One"), track_paths={}
+    )
+    os.makedirs(album1.folder)
+    open(os.path.join(album1.folder, "01 - First.flac"), "w").close()
+    album3 = MagicMock(
+        folder=os.path.join(str(tmp_path), "Album Three"), track_paths={}
+    )
+    os.makedirs(album3.folder)  # downloaded, but the track's file is absent
+
+    infos = [
+        _make_info("A1", "01 - First", artist="A", title="First", position=1),
+        # Album never downloaded -> not in resolved map.
+        _make_info("A2", "02 - Second", artist="B", title="Second", position=2),
+        # Album downloaded but the file is missing on disk (failed track).
+        _make_info("A3", "03 - Third", artist="C", title="Third", position=3),
+    ]
+    resolved = {("qobuz", "A1"): album1, ("qobuz", "A3"): album3}
+
+    located = _playlist("Mix", config)._locate_album_files(infos, resolved)
+
+    assert located == {1: os.path.join(album1.folder, "01 - First.flac")}
+
+
+def test_locate_album_files_namespaces_album_id_by_source(tmp_path):
+    """Two different albums sharing a bare id on different sources don't
+    collide: each entry resolves to its own source's album."""
+    config = _make_config(tmp_path)
+
+    album_q = MagicMock(
+        folder=os.path.join(str(tmp_path), "Q"),
+        track_paths={"tq": os.path.join(str(tmp_path), "Q", "q.flac")},
+    )
+    album_t = MagicMock(
+        folder=os.path.join(str(tmp_path), "T"),
+        track_paths={"tt": os.path.join(str(tmp_path), "T", "t.flac")},
+    )
+    infos = [
+        _make_info("100", "q", artist="A", title="Q", track_id="tq",
+                   source="qobuz", position=1),
+        _make_info("100", "t", artist="B", title="T", track_id="tt",
+                   source="tidal", position=2),
+    ]
+    resolved = {("qobuz", "100"): album_q, ("tidal", "100"): album_t}
+
+    located = _playlist("Mix", config)._locate_album_files(infos, resolved)
+
+    assert located == {1: album_q.track_paths["tq"], 2: album_t.track_paths["tt"]}
+
+
+# --- _write_m3u --------------------------------------------------------------
+
+
 def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     config = _make_config(tmp_path)
 
-    # Two albums downloaded directly under the downloads folder.
-    album1 = MagicMock(folder=os.path.join(str(tmp_path), "Album One"))
-    album2 = MagicMock(folder=os.path.join(str(tmp_path), "Album Two"))
-    os.makedirs(album1.folder)
-    os.makedirs(album2.folder)
-    # The actual track files (extension differs to prove glob-by-stem works).
-    open(os.path.join(album1.folder, "01 - First.flac"), "w").close()
-    open(os.path.join(album2.folder, "02 - Second.mp3"), "w").close()
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.mp3")
 
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First"),
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second"),
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
     ]
-    resolved = {"A1": album1, "A2": album2}
+    album_files = {1: f1, 2: f2}
 
-    playlist = Playlist("My Mix", config, MagicMock(), [], MagicMock())
-    playlist._write_m3u(infos, resolved, {})
+    _playlist("My Mix", config)._write_m3u(infos, album_files, {})
 
     m3u_path = os.path.join(str(tmp_path), "playlist", "My Mix.m3u")
     assert os.path.exists(m3u_path)
@@ -85,31 +220,21 @@ def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     ]
 
 
-def test_write_m3u_omits_missing_album_and_missing_file(tmp_path):
+def test_write_m3u_omits_unlocated_tracks(tmp_path):
     config = _make_config(tmp_path)
 
-    album1 = MagicMock(folder=os.path.join(str(tmp_path), "Album One"))
-    os.makedirs(album1.folder)
-    open(os.path.join(album1.folder, "01 - First.flac"), "w").close()
-
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First"),
-        # Album was never downloaded (not in resolved map) -> omitted.
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second"),
-        # Album downloaded but the file is absent on disk -> omitted.
-        _make_info("A3", "03 - Third", artist="Artist C", title="Third"),
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        # Not located in an album and no single -> omitted.
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
     ]
-    album3 = MagicMock(folder=os.path.join(str(tmp_path), "Album Three"))
-    os.makedirs(album3.folder)
-    resolved = {"A1": album1, "A3": album3}
 
-    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
-    playlist._write_m3u(infos, resolved, {})
+    _playlist("Mix", config)._write_m3u(infos, {1: f1}, {})
 
     with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
         content = f.read()
 
-    # Only the one track whose file exists is referenced.
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
@@ -117,47 +242,22 @@ def test_write_m3u_omits_missing_album_and_missing_file(tmp_path):
     ]
 
 
-def test_write_m3u_honors_disc_subdirectories(tmp_path):
-    config = _make_config(tmp_path, disc_subdirectories=True)
-
-    album = MagicMock(folder=os.path.join(str(tmp_path), "Multi Disc"))
-    disc2 = os.path.join(album.folder, "Disc 2")
-    os.makedirs(disc2)
-    open(os.path.join(disc2, "05 - Deep Cut.flac"), "w").close()
-
-    info = _make_info(
-        "A1", "05 - Deep Cut", artist="Artist", title="Deep Cut",
-        disctotal=2, discnumber=2,
-    )
-
-    playlist = Playlist("Discs", config, MagicMock(), [], MagicMock())
-    playlist._write_m3u([info], {"A1": album}, {})
-
-    with open(os.path.join(str(tmp_path), "playlist", "Discs.m3u"), encoding="utf-8") as f:
-        content = f.read()
-
-    assert os.path.join("..", "Multi Disc", "Disc 2", "05 - Deep Cut.flac") in content
-
-
 def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
-    """Tracks with no album (album_id is None) are referenced via the resolved
-    single Track's download_path."""
+    """Tracks with no album are referenced via the resolved single Track's
+    download_path, keyed by (source, track_id)."""
     config = _make_config(tmp_path)
 
-    # A single downloaded somewhere under the downloads folder.
-    single_dir = os.path.join(str(tmp_path), "Some Artist")
-    os.makedirs(single_dir)
-    single_file = os.path.join(single_dir, "Loose Track.flac")
-    open(single_file, "w").close()
+    single_file = os.path.join(str(tmp_path), "Some Artist", "Loose Track.flac")
     track = MagicMock(download_path=single_file)
 
     info = _make_info(
         None, "Loose Track", artist="Some Artist", title="Loose Track",
-        track_id="sc123",
+        track_id="sc123", source="soundcloud", position=1,
     )
 
-    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
-    playlist._write_m3u([info], {}, {"sc123": track})
+    _playlist("Mix", config)._write_m3u(
+        [info], {}, {("soundcloud", "sc123"): track}
+    )
 
     with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
         content = f.read()
@@ -178,12 +278,11 @@ def test_write_m3u_single_rerun_fallback_globs_existing_file(tmp_path):
 
     info = _make_info(
         None, "Loose Track", artist="Some Artist", title="Loose Track",
-        track_id="sc1",
+        track_id="sc1", source="soundcloud", position=1,
     )
 
-    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
     # resolved_singles is empty: the single was not (re)downloaded this run.
-    playlist._write_m3u([info], {}, {})
+    _playlist("Mix", config)._write_m3u([info], {}, {})
 
     with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
         content = f.read()
@@ -195,32 +294,27 @@ def test_write_m3u_single_rerun_fallback_globs_existing_file(tmp_path):
     ]
 
 
-def test_write_m3u_album_failure_falls_back_to_single(tmp_path):
-    """A track whose backing album failed to download is referenced via the
-    single it was downloaded as instead of being dropped."""
+def test_write_m3u_does_not_clobber_existing_file_when_nothing_located(tmp_path):
+    """A re-run where nothing can be located must leave a previously-good m3u
+    intact rather than truncating it to a header-only stub."""
     config = _make_config(tmp_path)
 
-    single_file = os.path.join(str(tmp_path), "Fallback Track.flac")
-    open(single_file, "w").close()
-    track = MagicMock(download_path=single_file)
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    good_contents = "#EXTM3U\n#EXTINF:-1,Artist - Song\n../Album/01.flac\n"
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(good_contents)
 
-    # album_id is set, but the album is absent from resolved_albums (failed).
-    info = _make_info(
-        "A1", "Fallback Track", artist="Artist", title="Fallback Track",
-        track_id="t9",
-    )
+    # Album not located and no single (file absent on disk) -> nothing to write.
+    info = _make_info("A1", "01 - Missing", artist="Artist", title="Missing", position=1)
+    _playlist("Mix", config)._write_m3u([info], {}, {})
 
-    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
-    playlist._write_m3u([info], {}, {"t9": track})
+    with open(m3u_path, encoding="utf-8") as f:
+        assert f.read() == good_contents
 
-    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
-        content = f.read()
 
-    assert content.splitlines() == [
-        "#EXTM3U",
-        "#EXTINF:-1,Artist - Fallback Track",
-        os.path.join("..", "Fallback Track.flac"),
-    ]
+# --- helpers -----------------------------------------------------------------
 
 
 def test_singles_folder_without_add_singles_to_folder(tmp_path):
