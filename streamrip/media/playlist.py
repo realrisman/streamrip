@@ -353,7 +353,12 @@ class Playlist(Media):
     ) -> str | None:
         """Return the path of a single-downloaded track for a playlist entry."""
         track = resolved_singles.get((info.client.source, info.track_id))
-        if track is not None:
+        if track is not None and not track.failed:
+            # A failed download deletes its partial file and sets `failed`
+            # (see Track.download); referencing track.download_path would point
+            # the m3u at a nonexistent file. Mirror the album path's guard
+            # (Album records only non-failed tracks) and fall through to the
+            # glob below, which won't match the deleted file.
             return track.download_path
 
         # The single was skipped this run (already in the database). Glob its

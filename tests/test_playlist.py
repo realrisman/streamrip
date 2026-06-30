@@ -362,7 +362,7 @@ def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
     config = _make_config(tmp_path)
 
     single_file = os.path.join(str(tmp_path), "Some Artist", "Loose Track.flac")
-    track = MagicMock(download_path=single_file)
+    track = MagicMock(download_path=single_file, failed=False)
 
     info = _make_info(
         None, "Loose Track", artist="Some Artist", title="Loose Track",
@@ -381,6 +381,43 @@ def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
         "#EXTINF:-1,Some Artist - Loose Track",
         os.path.join("..", "Some Artist", "Loose Track.flac"),
     ]
+
+
+def test_write_m3u_omits_failed_single(tmp_path):
+    """A single whose download failed (file deleted, `failed=True`) must not be
+    referenced by its (now nonexistent) download_path. It falls through to the
+    glob, which misses, so the track is omitted rather than written as a dead
+    link."""
+    config = _make_config(tmp_path)  # add_singles_to_folder False -> downloads root
+
+    good = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    # The failed track's download_path points at a file that was deleted on
+    # failure; it must never appear in the m3u.
+    dead_path = os.path.join(str(tmp_path), "Some Artist", "Loose Track.flac")
+    failed_track = MagicMock(download_path=dead_path, failed=True)
+
+    infos = [
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info(
+            None, "Loose Track", artist="Some Artist", title="Loose Track",
+            track_id="sc2", source="soundcloud", position=2,
+        ),
+    ]
+
+    _playlist("Mix", config)._write_m3u(
+        infos, {1: good}, {("soundcloud", "sc2"): failed_track}
+    )
+
+    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
+        content = f.read()
+
+    # Only the located album track is present; the failed single is omitted.
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        os.path.join("..", "Album One", "01 - First.flac"),
+    ]
+    assert "Loose Track.flac" not in content
 
 
 def test_write_m3u_single_rerun_fallback_globs_existing_file(tmp_path):
