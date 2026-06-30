@@ -38,6 +38,22 @@ def format_track_filename(meta: TrackMetadata, config: Config) -> str:
     return name
 
 
+def singles_folder(config: Config, source: str, album_meta: AlbumMetadata) -> str:
+    """Return the folder a single track is downloaded into.
+
+    Single source of truth for ``PendingSingle``'s destination so that callers
+    which need to locate a single's file (e.g. playlist m3u generation) stay in
+    sync with what ``PendingSingle`` actually writes.
+    """
+    c = config.session
+    parent = c.downloads.folder
+    if not c.filepaths.add_singles_to_folder:
+        return parent
+    if c.downloads.source_subdirectories:
+        parent = os.path.join(parent, source.capitalize())
+    return os.path.join(parent, album_meta.format_folder_path(c.filepaths.folder_format))
+
+
 @dataclass(slots=True)
 class Track(Media):
     meta: TrackMetadata
@@ -285,11 +301,7 @@ class PendingSingle(Pending):
         config = self.config.session
         quality = getattr(config, self.client.source).quality
         assert isinstance(quality, int)
-        parent = config.downloads.folder
-        if config.filepaths.add_singles_to_folder:
-            folder = self._format_folder(album)
-        else:
-            folder = parent
+        folder = singles_folder(self.config, self.client.source, album)
 
         os.makedirs(folder, exist_ok=True)
 
@@ -308,15 +320,6 @@ class PendingSingle(Pending):
             quality,
             is_single=True,
         )
-
-    def _format_folder(self, meta: AlbumMetadata) -> str:
-        c = self.config.session
-        parent = c.downloads.folder
-        formatter = c.filepaths.folder_format
-        if c.downloads.source_subdirectories:
-            parent = os.path.join(parent, self.client.source.capitalize())
-
-        return os.path.join(parent, meta.format_folder_path(formatter))
 
     async def _download_cover(self, covers: Covers, folder: str) -> str | None:
         embed_path, _ = await download_artwork(
