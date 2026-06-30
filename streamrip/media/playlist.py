@@ -17,7 +17,7 @@ from ..config import Config
 from ..console import console
 from ..db import Database
 from ..exceptions import NonStreamableError
-from ..filepath_utils import clean_filepath
+from ..filepath_utils import clean_filename
 from ..metadata import (
     AlbumMetadata,
     PlaylistMetadata,
@@ -247,7 +247,7 @@ class Playlist(Media):
         downloads_config = self.config.session.downloads
         playlist_folder = os.path.join(downloads_config.folder, "playlist")
         os.makedirs(playlist_folder, exist_ok=True)
-        m3u_path = os.path.join(playlist_folder, clean_filepath(self.name) + ".m3u")
+        m3u_path = os.path.join(playlist_folder, clean_filename(self.name) + ".m3u")
 
         lines = ["#EXTM3U"]
         for info in infos:

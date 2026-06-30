@@ -273,6 +273,26 @@ def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     ]
 
 
+def test_write_m3u_sanitizes_playlist_name_with_slash(tmp_path):
+    """Regression (finding 1): a playlist name containing a path separator must
+    be sanitized to a single filename component, not crash the write by treating
+    the '/' as an (uncreated) subdirectory."""
+    config = _make_config(tmp_path)
+
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="A", title="First", position=1)
+
+    # Would raise FileNotFoundError if the name were used as a path (clean_filepath).
+    _playlist("Rock/Metal", config)._write_m3u([info], {1: f1}, {})
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    entries = os.listdir(playlist_folder)
+    # The slash was stripped: a single .m3u file lands directly in the folder,
+    # with no nested directory created from the separator.
+    assert entries == ["RockMetal.m3u"]
+    assert os.path.isfile(os.path.join(playlist_folder, "RockMetal.m3u"))
+
+
 def test_write_m3u_omits_unlocated_tracks(tmp_path):
     config = _make_config(tmp_path)
 
