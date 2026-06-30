@@ -197,7 +197,10 @@ class Track(Media):
         if self.config.session.conversion.enabled:
             await self._convert()
 
-        self.db.set_downloaded(self.meta.info.id)
+        # Record the final path (post-conversion, so the extension is correct)
+        # so later runs can reference this exact file by id instead of
+        # reconstructing the folder and globbing for it.
+        self.db.set_downloaded(self.meta.info.id, self.download_path)
 
     async def _convert(self):
         c = self.config.session.conversion
