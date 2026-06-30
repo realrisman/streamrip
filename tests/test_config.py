@@ -119,6 +119,22 @@ def test_config_throws_outdated():
         _ = Config(OLD_CONFIG)
 
 
+def test_config_tolerates_stale_keys_at_current_version():
+    """A config that reports the current version but still carries keys that
+    were removed (e.g. a hand-edited or partially-migrated file) must load
+    rather than raising an uncaught TypeError from the dataclass constructor."""
+    with open(SAMPLE_CONFIG) as f:
+        toml = tomlkit.parse(f.read())  # type: ignore
+    # Re-introduce a key that no longer exists on MetadataConfig.
+    toml["metadata"]["set_playlist_to_album"] = True  # type: ignore
+
+    data = ConfigData.from_toml(tomlkit.dumps(toml))
+
+    # Loaded successfully; the unknown key was dropped, valid keys preserved.
+    assert data.metadata.exclude == []
+    assert not hasattr(data.metadata, "set_playlist_to_album")
+
+
 def test_config_file_update():
     tmp_conf = "tests/test_config_old2.toml"
     shutil.copy("tests/test_config_old.toml", tmp_conf)

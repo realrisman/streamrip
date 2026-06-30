@@ -274,21 +274,30 @@ class ConfigData:
                 f"Need to update config from {v} to {CURRENT_CONFIG_VERSION}",
             )
 
-        downloads = DownloadsConfig(**toml["downloads"])  # type: ignore
-        qobuz = QobuzConfig(**toml["qobuz"])  # type: ignore
-        tidal = TidalConfig(**toml["tidal"])  # type: ignore
-        deezer = DeezerConfig(**toml["deezer"])  # type: ignore
-        soundcloud = SoundcloudConfig(**toml["soundcloud"])  # type: ignore
-        youtube = YoutubeConfig(**toml["youtube"])  # type: ignore
-        lastfm = LastFmConfig(**toml["lastfm"])  # type: ignore
-        artwork = ArtworkConfig(**toml["artwork"])  # type: ignore
-        filepaths = FilepathsConfig(**toml["filepaths"])  # type: ignore
-        metadata = MetadataConfig(**toml["metadata"])  # type: ignore
-        qobuz_filters = QobuzDiscographyFilterConfig(**toml["qobuz_filters"])  # type: ignore
-        cli = CliConfig(**toml["cli"])  # type: ignore
-        database = DatabaseConfig(**toml["database"])  # type: ignore
-        conversion = ConversionConfig(**toml["conversion"])  # type: ignore
-        misc = MiscConfig(**toml["misc"])  # type: ignore
+        def known(config_cls, section):
+            # Drop keys the dataclass no longer defines so a config that still
+            # carries removed keys (e.g. a hand-edited or partially-migrated file
+            # whose `version` already reads the current one, bypassing the guard
+            # above) loads instead of raising an uncaught TypeError. Missing keys
+            # still raise, surfacing genuinely incomplete configs.
+            valid = {f.name for f in fields(config_cls)}
+            return {k: v for k, v in section.items() if k in valid}
+
+        downloads = DownloadsConfig(**known(DownloadsConfig, toml["downloads"]))  # type: ignore
+        qobuz = QobuzConfig(**known(QobuzConfig, toml["qobuz"]))  # type: ignore
+        tidal = TidalConfig(**known(TidalConfig, toml["tidal"]))  # type: ignore
+        deezer = DeezerConfig(**known(DeezerConfig, toml["deezer"]))  # type: ignore
+        soundcloud = SoundcloudConfig(**known(SoundcloudConfig, toml["soundcloud"]))  # type: ignore
+        youtube = YoutubeConfig(**known(YoutubeConfig, toml["youtube"]))  # type: ignore
+        lastfm = LastFmConfig(**known(LastFmConfig, toml["lastfm"]))  # type: ignore
+        artwork = ArtworkConfig(**known(ArtworkConfig, toml["artwork"]))  # type: ignore
+        filepaths = FilepathsConfig(**known(FilepathsConfig, toml["filepaths"]))  # type: ignore
+        metadata = MetadataConfig(**known(MetadataConfig, toml["metadata"]))  # type: ignore
+        qobuz_filters = QobuzDiscographyFilterConfig(**known(QobuzDiscographyFilterConfig, toml["qobuz_filters"]))  # type: ignore
+        cli = CliConfig(**known(CliConfig, toml["cli"]))  # type: ignore
+        database = DatabaseConfig(**known(DatabaseConfig, toml["database"]))  # type: ignore
+        conversion = ConversionConfig(**known(ConversionConfig, toml["conversion"]))  # type: ignore
+        misc = MiscConfig(**known(MiscConfig, toml["misc"]))  # type: ignore
 
         return cls(
             toml=toml,
