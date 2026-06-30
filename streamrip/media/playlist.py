@@ -24,10 +24,11 @@ from ..metadata import (
     SearchResults,
     TrackMetadata,
 )
+from ..metadata.util import get_album_id_from_track
 from ..utils.ssl_utils import get_aiohttp_connector_kwargs
 from .album import Album, PendingAlbum
 from .media import Media, Pending
-from .track import format_track_filename
+from .track import PendingSingle, Track, format_track_filename
 
 logger = logging.getLogger("streamrip")
 
@@ -43,7 +44,9 @@ class PlaylistTrackInfo:
     position: int
     track_id: str
     client: Client
-    album_id: str
+    # None when the source has no album for this track (e.g. SoundCloud); such
+    # tracks are downloaded as singles instead of as part of an album.
+    album_id: str | None
     album_meta: AlbumMetadata
     track_meta: TrackMetadata
 
@@ -87,7 +90,10 @@ class PendingPlaylistTrack(Pending):
             position=self.position,
             track_id=self.id,
             client=self.client,
-            album_id=album.info.id,
+            # NOTE: not album.info.id — for some sources (Qobuz, Tidal) that is
+            # not the id the album endpoint accepts. Pull the fetchable album id
+            # straight from the track response instead.
+            album_id=get_album_id_from_track(self.client.source, resp),
             album_meta=album,
             track_meta=meta,
         )
@@ -99,6 +105,7 @@ class Playlist(Media):
     config: Config
     client: Client
     tracks: list[PendingPlaylistTrack]
+    db: Database
 
     async def preprocess(self):
         progress.add_title(self.name)
@@ -113,12 +120,14 @@ class Playlist(Media):
             logger.error(f"No tracks could be resolved for playlist '{self.name}'")
             return
 
-        # Phase B: download each distinct album once (full album).
+        # Phase B: download each distinct album once (full album), plus any
+        # album-less tracks (e.g. SoundCloud) as singles.
         resolved_albums = await self._download_albums(infos)
+        resolved_singles = await self._download_singles(infos)
 
         # Phase C: write an m3u that references the tracks inside their album
         # folders (which live outside the `playlist` folder).
-        self._write_m3u(infos, resolved_albums)
+        self._write_m3u(infos, resolved_albums, resolved_singles)
 
     async def _resolve_track_infos(self) -> list[PlaylistTrackInfo]:
         chunk_size = 20
@@ -141,8 +150,11 @@ class Playlist(Media):
         infos: list[PlaylistTrackInfo],
     ) -> dict[str, Album]:
         # Dedupe album ids, keeping the first client seen for each album.
+        # Tracks without an album (album_id is None) are handled as singles.
         unique: dict[str, Client] = {}
         for info in infos:
+            if info.album_id is None:
+                continue
             unique.setdefault(info.album_id, info.client)
 
         resolved: dict[str, Album] = {}
@@ -174,10 +186,56 @@ class Playlist(Media):
         await album.rip()
         return album
 
+    async def _download_singles(
+        self,
+        infos: list[PlaylistTrackInfo],
+    ) -> dict[str, Track]:
+        """Download album-less playlist tracks (e.g. SoundCloud) as singles.
+
+        Returns the resolved `Track` per track id so the m3u can reference the
+        downloaded file directly.
+        """
+        # Dedupe by track id, keeping the first client seen for each track.
+        unique: dict[str, Client] = {}
+        for info in infos:
+            if info.album_id is not None:
+                continue
+            unique.setdefault(info.track_id, info.client)
+
+        resolved: dict[str, Track] = {}
+        chunk_size = 5
+        for batch in self.batch(list(unique.items()), chunk_size):
+            results = await asyncio.gather(
+                *[
+                    self._resolve_and_download_single(track_id, client)
+                    for track_id, client in batch
+                ],
+                return_exceptions=True,
+            )
+            for (track_id, _), result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error downloading track {track_id}: {result}")
+                elif result is not None:
+                    resolved[track_id] = result
+        return resolved
+
+    async def _resolve_and_download_single(
+        self,
+        track_id: str,
+        client: Client,
+    ) -> Track | None:
+        pending = PendingSingle(track_id, client, self.config, self.db)
+        track = await pending.resolve()
+        if track is None:
+            return None
+        await track.rip()
+        return track
+
     def _write_m3u(
         self,
         infos: list[PlaylistTrackInfo],
         resolved_albums: dict[str, Album],
+        resolved_singles: dict[str, Track],
     ):
         downloads_config = self.config.session.downloads
         playlist_folder = os.path.join(downloads_config.folder, "playlist")
@@ -186,32 +244,17 @@ class Playlist(Media):
 
         lines = ["#EXTM3U"]
         for info in infos:
-            album = resolved_albums.get(info.album_id)
-            if album is None:
-                logger.warning(
-                    f"Album for track '{info.track_meta.title}' was not downloaded; "
-                    "omitting from playlist file",
-                )
-                continue
-
-            expected_dir = album.folder
-            if downloads_config.disc_subdirectories and info.album_meta.disctotal > 1:
-                expected_dir = os.path.join(
-                    expected_dir,
-                    f"Disc {info.track_meta.discnumber}",
-                )
-
-            stem = format_track_filename(info.track_meta, self.config)
-            pattern = os.path.join(glob.escape(expected_dir), glob.escape(stem) + ".*")
-            matches = glob.glob(pattern)
-            if not matches:
+            track_file = self._locate_track_file(
+                info, resolved_albums, resolved_singles
+            )
+            if track_file is None:
                 logger.warning(
                     f"Could not locate downloaded file for '{info.track_meta.title}'; "
                     "omitting from playlist file",
                 )
                 continue
 
-            rel_path = os.path.relpath(matches[0], start=playlist_folder)
+            rel_path = os.path.relpath(track_file, start=playlist_folder)
             lines.append(
                 f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}",
             )
@@ -221,6 +264,38 @@ class Playlist(Media):
             f.write("\n".join(lines) + "\n")
         logger.info(f"Wrote playlist file to {m3u_path}")
         console.print(f"[green]Wrote playlist file to[/green] {m3u_path}")
+
+    def _locate_track_file(
+        self,
+        info: PlaylistTrackInfo,
+        resolved_albums: dict[str, Album],
+        resolved_singles: dict[str, Track],
+    ) -> str | None:
+        """Return the path of the downloaded file for a playlist entry, or None."""
+        # Album-less track downloaded as a single: use the resolved Track's path.
+        if info.album_id is None:
+            track = resolved_singles.get(info.track_id)
+            return track.download_path if track is not None else None
+
+        album = resolved_albums.get(info.album_id)
+        if album is None:
+            return None
+
+        # The track lives inside the downloaded album folder. Glob for the
+        # filename stem so the match survives format conversion (changed
+        # extension) and re-runs where the file already exists.
+        expected_dir = album.folder
+        downloads_config = self.config.session.downloads
+        if downloads_config.disc_subdirectories and info.album_meta.disctotal > 1:
+            expected_dir = os.path.join(
+                expected_dir,
+                f"Disc {info.track_meta.discnumber}",
+            )
+
+        stem = format_track_filename(info.track_meta, self.config)
+        pattern = os.path.join(glob.escape(expected_dir), glob.escape(stem) + ".*")
+        matches = glob.glob(pattern)
+        return matches[0] if matches else None
 
     @staticmethod
     def batch(iterable, n=1):
@@ -262,7 +337,7 @@ class PendingPlaylist(Pending):
             )
             for position, id in enumerate(meta.ids())
         ]
-        return Playlist(name, self.config, self.client, tracks)
+        return Playlist(name, self.config, self.client, tracks, self.db)
 
 
 @dataclass(slots=True)
@@ -343,7 +418,7 @@ class PendingLastfmPlaylist(Pending):
                 ),
             )
 
-        return Playlist(playlist_title, self.config, self.client, pending_tracks)
+        return Playlist(playlist_title, self.config, self.client, pending_tracks, self.db)
 
     async def _make_query(
         self,

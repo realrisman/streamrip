@@ -34,6 +34,7 @@ class TestErrorHandling:
             config=mock_config,
             client=mock_client,
             tracks=[mock_track_success, mock_track_failure],
+            db=MagicMock(),
         )
 
         with patch.object(

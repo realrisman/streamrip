@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from streamrip.media.playlist import Playlist
 from streamrip.media.track import format_track_filename
+from streamrip.metadata.util import get_album_id_from_track
 
 
 def _make_config(tmp_path, *, disc_subdirectories=False):
@@ -17,9 +18,10 @@ def _make_config(tmp_path, *, disc_subdirectories=False):
     return config
 
 
-def _make_info(album_id, stem, *, artist, title, disctotal=1, discnumber=1):
+def _make_info(album_id, stem, *, artist, title, disctotal=1, discnumber=1, track_id="t"):
     info = MagicMock()
     info.album_id = album_id
+    info.track_id = track_id
     info.album_meta.disctotal = disctotal
     info.track_meta.format_track_path.return_value = stem
     info.track_meta.artist = artist
@@ -57,8 +59,8 @@ def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     ]
     resolved = {"A1": album1, "A2": album2}
 
-    playlist = Playlist("My Mix", config, MagicMock(), [])
-    playlist._write_m3u(infos, resolved)
+    playlist = Playlist("My Mix", config, MagicMock(), [], MagicMock())
+    playlist._write_m3u(infos, resolved, {})
 
     m3u_path = os.path.join(str(tmp_path), "playlist", "My Mix.m3u")
     assert os.path.exists(m3u_path)
@@ -92,8 +94,8 @@ def test_write_m3u_omits_missing_album_and_missing_file(tmp_path):
     os.makedirs(album3.folder)
     resolved = {"A1": album1, "A3": album3}
 
-    playlist = Playlist("Mix", config, MagicMock(), [])
-    playlist._write_m3u(infos, resolved)
+    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
+    playlist._write_m3u(infos, resolved, {})
 
     with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
         content = f.read()
@@ -119,10 +121,53 @@ def test_write_m3u_honors_disc_subdirectories(tmp_path):
         disctotal=2, discnumber=2,
     )
 
-    playlist = Playlist("Discs", config, MagicMock(), [])
-    playlist._write_m3u([info], {"A1": album})
+    playlist = Playlist("Discs", config, MagicMock(), [], MagicMock())
+    playlist._write_m3u([info], {"A1": album}, {})
 
     with open(os.path.join(str(tmp_path), "playlist", "Discs.m3u"), encoding="utf-8") as f:
         content = f.read()
 
     assert os.path.join("..", "Multi Disc", "Disc 2", "05 - Deep Cut.flac") in content
+
+
+def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
+    """Tracks with no album (album_id is None) are referenced via the resolved
+    single Track's download_path."""
+    config = _make_config(tmp_path)
+
+    # A single downloaded somewhere under the downloads folder.
+    single_dir = os.path.join(str(tmp_path), "Some Artist")
+    os.makedirs(single_dir)
+    single_file = os.path.join(single_dir, "Loose Track.flac")
+    open(single_file, "w").close()
+    track = MagicMock(download_path=single_file)
+
+    info = _make_info(
+        None, "Loose Track", artist="Some Artist", title="Loose Track",
+        track_id="sc123",
+    )
+
+    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
+    playlist._write_m3u([info], {}, {"sc123": track})
+
+    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Some Artist - Loose Track",
+        os.path.join("..", "Some Artist", "Loose Track.flac"),
+    ]
+
+
+def test_get_album_id_from_track():
+    # qobuz/tidal/deezer expose the fetchable album id at resp["album"]["id"].
+    for source in ("qobuz", "tidal", "deezer"):
+        resp = {"album": {"id": "0060254767005", "qobuz_id": 30369460}}
+        assert get_album_id_from_track(source, resp) == "0060254767005"
+
+    # soundcloud has no album concept.
+    assert get_album_id_from_track("soundcloud", {"album": {"id": "x"}}) is None
+    # missing/empty album object -> None.
+    assert get_album_id_from_track("qobuz", {}) is None
+    assert get_album_id_from_track("qobuz", {"album": {}}) is None
