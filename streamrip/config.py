@@ -17,7 +17,7 @@ logger = logging.getLogger("streamrip")
 APP_DIR = click.get_app_dir("streamrip")
 os.makedirs(APP_DIR, exist_ok=True)
 DEFAULT_CONFIG_PATH = os.path.join(APP_DIR, "config.toml")
-CURRENT_CONFIG_VERSION = "2.2.1"
+CURRENT_CONFIG_VERSION = "3.0.0"
 
 
 class OutdatedConfigError(Exception):
@@ -154,12 +154,6 @@ class ArtworkConfig:
 
 @dataclass(slots=True)
 class MetadataConfig:
-    # Sets the value of the 'ALBUM' field in the metadata to the playlist's name.
-    # This is useful if your music library software organizes tracks based on album name.
-    set_playlist_to_album: bool
-    # If part of a playlist, sets the `tracknumber` field in the metadata to the track's
-    # position in the playlist instead of its position in its album
-    renumber_playlist_tracks: bool
     # The following metadata tags won't be applied
     # See https://github.com/nathom/streamrip/wiki/Metadata-Tag-Names for more info
     exclude: list[str]

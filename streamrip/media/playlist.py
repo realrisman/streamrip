@@ -28,9 +28,20 @@ from ..metadata.util import get_album_id_from_track
 from ..utils.ssl_utils import get_aiohttp_connector_kwargs
 from .album import Album, PendingAlbum
 from .media import Media, Pending
-from .track import PendingSingle, Track, format_track_filename, singles_folder
+from .track import (
+    PendingSingle,
+    Track,
+    album_folder,
+    format_track_filename,
+    singles_folder,
+)
 
 logger = logging.getLogger("streamrip")
+
+# Number of playlist tracks whose metadata is resolved concurrently.
+TRACK_RESOLVE_CHUNK = 20
+# Number of albums/singles downloaded concurrently per batch.
+DOWNLOAD_CHUNK = 5
 
 
 @dataclass(slots=True)
@@ -135,9 +146,8 @@ class Playlist(Media):
         self._write_m3u(infos, album_files, resolved_singles)
 
     async def _resolve_track_infos(self) -> list[PlaylistTrackInfo]:
-        chunk_size = 20
         infos: list[PlaylistTrackInfo] = []
-        for batch in self.batch(self.tracks, chunk_size):
+        for batch in self.batch(self.tracks, TRACK_RESOLVE_CHUNK):
             results = await asyncio.gather(
                 *[item.resolve() for item in batch],
                 return_exceptions=True,
@@ -154,44 +164,13 @@ class Playlist(Media):
         self,
         infos: list[PlaylistTrackInfo],
     ) -> dict[tuple[str, str], Album]:
-        # Dedupe albums by (source, album_id), keeping the first client seen for
-        # each. The source must be part of the key: a last.fm playlist can mix
-        # sources, and a bare numeric id can collide across them. Tracks without
-        # an album (album_id is None) are handled as singles.
-        unique: dict[tuple[str, str], Client] = {}
-        for info in infos:
-            if info.album_id is None:
-                continue
-            unique.setdefault((info.client.source, info.album_id), info.client)
-
-        resolved: dict[tuple[str, str], Album] = {}
-        album_chunk_size = 5
-        for batch in self.batch(list(unique.items()), album_chunk_size):
-            results = await asyncio.gather(
-                *[
-                    self._resolve_and_download_album(key[1], client)
-                    for key, client in batch
-                ],
-                return_exceptions=True,
-            )
-            for (key, _), result in zip(batch, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Error downloading album {key}: {result}")
-                elif result is not None:
-                    resolved[key] = result
-        return resolved
-
-    async def _resolve_and_download_album(
-        self,
-        album_id: str,
-        client: Client,
-    ) -> Album | None:
-        pending = PendingAlbum(album_id, client, self.config, self.db)
-        album = await pending.resolve()
-        if album is None:
-            return None
-        await album.rip()
-        return album
+        # Dedupe albums by (source, album_id). The source must be part of the
+        # key: a last.fm playlist can mix sources, and a bare numeric id can
+        # collide across them. Tracks without an album (album_id is None) are
+        # skipped here and handled as singles instead.
+        return await self._dedupe_resolve_download(
+            infos, lambda info: info.album_id, PendingAlbum
+        )
 
     async def _download_singles(
         self,
@@ -206,41 +185,58 @@ class Playlist(Media):
         track is never lost. Returns the resolved `Track` keyed by
         (source, track_id) so the m3u can reference the downloaded file.
         """
-        # Dedupe by (source, track_id), keeping the first client seen for each.
-        # The source is part of the key because a last.fm playlist can mix
-        # sources whose bare track ids may collide.
+        return await self._dedupe_resolve_download(
+            infos, lambda info: info.track_id, PendingSingle
+        )
+
+    async def _dedupe_resolve_download(
+        self,
+        infos: list[PlaylistTrackInfo],
+        key_id,
+        pending_cls,
+    ) -> dict[tuple[str, str], Media]:
+        """Resolve and download each distinct media item once, concurrently.
+
+        `key_id(info)` selects the id to download (album id or track id); entries
+        whose id is None are skipped. Items are deduped by (source, id) — the
+        source is part of the key because a last.fm playlist can mix sources
+        whose bare ids may collide. Returns the downloaded objects keyed by
+        (source, id).
+        """
         unique: dict[tuple[str, str], Client] = {}
         for info in infos:
-            unique.setdefault((info.client.source, info.track_id), info.client)
+            id = key_id(info)
+            if id is None:
+                continue
+            unique.setdefault((info.client.source, id), info.client)
 
-        resolved: dict[tuple[str, str], Track] = {}
-        chunk_size = 5
-        for batch in self.batch(list(unique.items()), chunk_size):
+        resolved: dict[tuple[str, str], Media] = {}
+        for batch in self.batch(list(unique.items()), DOWNLOAD_CHUNK):
             results = await asyncio.gather(
                 *[
-                    self._resolve_and_download_single(key[1], client)
+                    self._resolve_and_download(pending_cls, key[1], client)
                     for key, client in batch
                 ],
                 return_exceptions=True,
             )
             for (key, _), result in zip(batch, results):
                 if isinstance(result, Exception):
-                    logger.error(f"Error downloading track {key}: {result}")
+                    logger.error(f"Error downloading {key}: {result}")
                 elif result is not None:
                     resolved[key] = result
         return resolved
 
-    async def _resolve_and_download_single(
+    async def _resolve_and_download(
         self,
-        track_id: str,
+        pending_cls,
+        id: str,
         client: Client,
-    ) -> Track | None:
-        pending = PendingSingle(track_id, client, self.config, self.db)
-        track = await pending.resolve()
-        if track is None:
+    ) -> Media | None:
+        obj = await pending_cls(id, client, self.config, self.db).resolve()
+        if obj is None:
             return None
-        await track.rip()
-        return track
+        await obj.rip()
+        return obj
 
     def _write_m3u(
         self,
@@ -290,55 +286,55 @@ class Playlist(Media):
         infos: list[PlaylistTrackInfo],
         resolved_albums: dict[tuple[str, str], Album],
     ) -> dict[int, str]:
-        """Locate each playlist entry's file inside its downloaded album.
+        """Locate each playlist entry's file inside its album.
 
         Returns a map of `info.position` -> on-disk path for the entries found.
         Entries omitted from the result need a single download instead.
         """
         located: dict[int, str] = {}
-        # Cache the per-album folder index so each album tree is walked at most
-        # once even when it backs many playlist entries.
-        index_cache: dict[str, dict[str, str]] = {}
         for info in infos:
             if info.album_id is None:
                 continue
-            album = resolved_albums.get((info.client.source, info.album_id))
-            if album is None:
-                continue
-
-            # The album download recorded the exact path it wrote, which is
-            # authoritative regardless of how `track_format` is configured.
-            path = album.track_paths.get(str(info.track_id))
-            if path is None:
-                # The track was skipped this run (already in the database), so
-                # it isn't in track_paths. Match it by filename stem against a
-                # one-time index of the album folder; this survives format
-                # conversion (changed extension) and disc subdirectories.
-                index = index_cache.get(album.folder)
-                if index is None:
-                    index = self._index_album_folder(album.folder)
-                    index_cache[album.folder] = index
-                stem = format_track_filename(info.track_meta, self.config)
-                path = index.get(stem)
+            path = self._locate_album_file(info, resolved_albums)
             if path is not None:
                 located[info.position] = path
         return located
 
-    @staticmethod
-    def _index_album_folder(folder: str) -> dict[str, str]:
-        """Map each file's stem (name without extension) to its path.
+    def _locate_album_file(
+        self,
+        info: PlaylistTrackInfo,
+        resolved_albums: dict[tuple[str, str], Album],
+    ) -> str | None:
+        """Locate one album-backed playlist entry's file on disk."""
+        album = resolved_albums.get((info.client.source, info.album_id))
+        if album is not None:
+            # The album download recorded the exact path it wrote, which is
+            # authoritative regardless of how `track_format`/`folder_format`
+            # are configured (and so is correct even when the playlist's
+            # track-embedded album metadata differs from the album endpoint's).
+            path = album.track_paths.get(str(info.track_id))
+            if path is not None:
+                return path
 
-        Walks the album folder tree once. Iterating in sorted order with
-        ``setdefault`` makes the choice deterministic if two files share a stem
-        (e.g. same-named tracks on different discs).
-        """
-        index: dict[str, str] = {}
-        pattern = os.path.join(glob.escape(folder), "**", "*")
-        for path in sorted(glob.glob(pattern, recursive=True)):
-            if os.path.isfile(path):
-                stem = os.path.splitext(os.path.basename(path))[0]
-                index.setdefault(stem, path)
-        return index
+        # The track was skipped this run (already in the database), or its album
+        # failed to (re)resolve this run but the file exists from a prior run.
+        # Reconstruct the exact folder the album writer used and glob it by
+        # filename stem; this survives format conversion (changed extension) and
+        # does not require the album object. Scoping to the track's own disc
+        # subfolder avoids matching a same-named track on a different disc.
+        #
+        # Known limitation: for a skipped track under a custom album-derived
+        # `track_format`/`folder_format`, the stem/folder built here from the
+        # track-embedded album metadata may differ from what the album endpoint
+        # produced; the track is then re-downloaded as a single rather than
+        # mis-referenced.
+        folder = album_folder(self.config, info.client.source, info.album_meta)
+        if (
+            self.config.session.downloads.disc_subdirectories
+            and info.album_meta.disctotal > 1
+        ):
+            folder = os.path.join(folder, f"Disc {info.track_meta.discnumber}")
+        return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
 
     def _locate_single_file(
         self,
@@ -353,9 +349,17 @@ class Playlist(Media):
         # The single was skipped this run (already in the database). Glob its
         # destination folder so the m3u still references the existing file.
         folder = singles_folder(self.config, info.client.source, info.album_meta)
-        stem = format_track_filename(info.track_meta, self.config)
+        return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
+
+    @staticmethod
+    def _glob_stem(folder: str, stem: str) -> str | None:
+        """Return the first file in `folder` whose name (sans extension) is `stem`.
+
+        Matches across a changed extension (format conversion). Sorted for a
+        deterministic choice if two files share a stem.
+        """
         pattern = os.path.join(glob.escape(folder), glob.escape(stem) + ".*")
-        matches = glob.glob(pattern)
+        matches = sorted(glob.glob(pattern))
         return matches[0] if matches else None
 
     @staticmethod

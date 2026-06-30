@@ -8,12 +8,11 @@ from ..client import Client
 from ..config import Config
 from ..db import Database
 from ..exceptions import NonStreamableError
-from ..filepath_utils import clean_filepath
 from ..metadata import AlbumMetadata
 from ..metadata.util import get_album_track_ids
 from .artwork import download_artwork
 from .media import Media, Pending
-from .track import PendingTrack
+from .track import PendingTrack, album_folder
 
 logger = logging.getLogger("streamrip")
 
@@ -88,12 +87,11 @@ class PendingAlbum(Pending):
             return None
 
         tracklist = get_album_track_ids(self.client.source, resp)
-        folder = self.config.session.downloads.folder
-        album_folder = self._album_folder(folder, meta)
-        os.makedirs(album_folder, exist_ok=True)
+        album_dir = album_folder(self.config, self.client.source, meta)
+        os.makedirs(album_dir, exist_ok=True)
         embed_cover, _ = await download_artwork(
             self.client.session,
-            album_folder,
+            album_dir,
             meta.covers,
             self.config.session.artwork,
             for_playlist=False,
@@ -104,22 +102,11 @@ class PendingAlbum(Pending):
                 album=meta,
                 client=self.client,
                 config=self.config,
-                folder=album_folder,
+                folder=album_dir,
                 db=self.db,
                 cover_path=embed_cover,
             )
             for id in tracklist
         ]
         logger.debug("Pending tracks: %s", pending_tracks)
-        return Album(meta, pending_tracks, self.config, album_folder, self.db)
-
-    def _album_folder(self, parent: str, meta: AlbumMetadata) -> str:
-        config = self.config.session
-        if config.downloads.source_subdirectories:
-            parent = os.path.join(parent, self.client.source.capitalize())
-        formatter = config.filepaths.folder_format
-        folder = clean_filepath(
-            meta.format_folder_path(formatter), config.filepaths.restrict_characters
-        )
-
-        return os.path.join(parent, folder)
+        return Album(meta, pending_tracks, self.config, album_dir, self.db)

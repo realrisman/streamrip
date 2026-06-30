@@ -8,7 +8,7 @@ from ..client import Client, Downloadable
 from ..config import Config
 from ..db import Database
 from ..exceptions import NonStreamableError
-from ..filepath_utils import clean_filename
+from ..filepath_utils import clean_filename, clean_filepath
 from ..metadata import AlbumMetadata, Covers, TrackMetadata, tag_file
 from ..progress import add_title, get_progress_callback, remove_title
 from .artwork import download_artwork
@@ -52,6 +52,24 @@ def singles_folder(config: Config, source: str, album_meta: AlbumMetadata) -> st
     if c.downloads.source_subdirectories:
         parent = os.path.join(parent, source.capitalize())
     return os.path.join(parent, album_meta.format_folder_path(c.filepaths.folder_format))
+
+
+def album_folder(config: Config, source: str, album_meta: AlbumMetadata) -> str:
+    """Return the folder an album's tracks are downloaded into.
+
+    Single source of truth for ``PendingAlbum``'s destination so that callers
+    which need to locate an album track's file (e.g. playlist m3u generation)
+    can reconstruct the exact folder the album writer used.
+    """
+    c = config.session
+    parent = c.downloads.folder
+    if c.downloads.source_subdirectories:
+        parent = os.path.join(parent, source.capitalize())
+    folder = clean_filepath(
+        album_meta.format_folder_path(c.filepaths.folder_format),
+        c.filepaths.restrict_characters,
+    )
+    return os.path.join(parent, folder)
 
 
 @dataclass(slots=True)
