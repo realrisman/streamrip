@@ -1,5 +1,5 @@
 import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from streamrip.media.playlist import Playlist
 from streamrip.media.track import format_track_filename, singles_folder
@@ -400,8 +400,10 @@ def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.mp3")
 
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
+        _make_info("A1", "01 - First", artist="Artist A", title="First",
+                   track_id="t1", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second",
+                   track_id="t2", position=2),
     ]
     album_files = {1: f1, 2: f2}
 
@@ -415,8 +417,10 @@ def test_write_m3u_uses_relative_paths_into_album_folders(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
         "#EXTINF:-1,Artist B - Second",
+        "#STREAMRIP:qobuz:t2",
         os.path.join("..", "Album Two", "02 - Second.mp3"),
     ]
 
@@ -446,9 +450,11 @@ def test_write_m3u_omits_unlocated_tracks(tmp_path):
 
     f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A1", "01 - First", artist="Artist A", title="First",
+                   track_id="t1", position=1),
         # Not located in an album and no single -> omitted.
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second",
+                   track_id="t2", position=2),
     ]
 
     _playlist("Mix", config)._write_m3u(infos, {1: f1}, {})
@@ -459,6 +465,7 @@ def test_write_m3u_omits_unlocated_tracks(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
     ]
 
@@ -486,6 +493,7 @@ def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Some Artist - Loose Track",
+        "#STREAMRIP:soundcloud:sc123",
         os.path.join("..", "Some Artist", "Loose Track.flac"),
     ]
 
@@ -504,7 +512,8 @@ def test_write_m3u_omits_failed_single(tmp_path):
     failed_track = MagicMock(download_path=dead_path, failed=True)
 
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A1", "01 - First", artist="Artist A", title="First",
+                   track_id="t1", position=1),
         _make_info(
             None, "Loose Track", artist="Some Artist", title="Loose Track",
             track_id="sc2", source="soundcloud", position=2,
@@ -522,6 +531,7 @@ def test_write_m3u_omits_failed_single(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
     ]
     assert "Loose Track.flac" not in content
@@ -548,6 +558,7 @@ def test_write_m3u_single_rerun_fallback_globs_existing_file(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Some Artist - Loose Track",
+        "#STREAMRIP:soundcloud:sc1",
         os.path.join("..", "Loose Track.flac"),
     ]
 
@@ -597,24 +608,31 @@ def test_write_m3u_does_not_shrink_existing_file_on_partial_run(tmp_path):
     # Only one of three tracks could be located this run.
     f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
-        _make_info("A3", "03 - Third", artist="Artist C", title="Third", position=3),
+        _make_info("A1", "01 - First", artist="Artist A", title="First",
+                   track_id="t1", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second",
+                   track_id="t2", position=2),
+        _make_info("A3", "03 - Third", artist="Artist C", title="Third",
+                   track_id="t3", position=3),
     ]
     _playlist("Mix", config)._write_m3u(infos, {1: f1}, {})
 
     with open(m3u_path, encoding="utf-8") as f:
         content = f.read()
 
-    # Track 1 (this run) first, then tracks 2 & 3 preserved from the old file —
-    # nothing lost, nothing duplicated.
+    # Track 1 (this run) first, then tracks 2 & 3 carried over from the old file
+    # (matched by label, since the old file predates the #STREAMRIP id) — nothing
+    # lost, nothing duplicated, and each carried-over track gains its id.
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
         "#EXTINF:-1,Artist B - Second",
+        "#STREAMRIP:qobuz:t2",
         os.path.join("..", "Album Two", "02 - Second.flac"),
         "#EXTINF:-1,Artist C - Third",
+        "#STREAMRIP:qobuz:t3",
         os.path.join("..", "Album Three", "03 - Third.flac"),
     ]
 
@@ -643,9 +661,12 @@ def test_write_m3u_preserves_order_on_degraded_rerun(tmp_path):
     # their existing (carried-over) entries.
     f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.flac")
     infos = [
-        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
-        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
-        _make_info("A3", "03 - Third", artist="Artist C", title="Third", position=3),
+        _make_info("A1", "01 - First", artist="Artist A", title="First",
+                   track_id="t1", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second",
+                   track_id="t2", position=2),
+        _make_info("A3", "03 - Third", artist="Artist C", title="Third",
+                   track_id="t3", position=3),
     ]
     _playlist("Mix", config)._write_m3u(infos, {2: f2}, {})
 
@@ -655,10 +676,13 @@ def test_write_m3u_preserves_order_on_degraded_rerun(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
         "#EXTINF:-1,Artist B - Second",
+        "#STREAMRIP:qobuz:t2",
         os.path.join("..", "Album Two", "02 - Second.flac"),
         "#EXTINF:-1,Artist C - Third",
+        "#STREAMRIP:qobuz:t3",
         os.path.join("..", "Album Three", "03 - Third.flac"),
     ]
 
@@ -682,7 +706,8 @@ def test_write_m3u_no_duplicate_when_track_relocates(tmp_path):
 
     # This run locates the same track (same artist/title) inside its album.
     new_file = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
-    info = _make_info("A1", "01 - First", artist="Artist A", title="First", position=1)
+    info = _make_info("A1", "01 - First", artist="Artist A", title="First",
+                      track_id="t1", position=1)
     _playlist("Mix", config)._write_m3u([info], {1: new_file}, {})
 
     with open(m3u_path, encoding="utf-8") as f:
@@ -692,6 +717,7 @@ def test_write_m3u_no_duplicate_when_track_relocates(tmp_path):
     assert content.splitlines() == [
         "#EXTM3U",
         "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
         os.path.join("..", "Album One", "01 - First.flac"),
     ]
 
@@ -760,6 +786,205 @@ def test_write_m3u_handles_non_utf8_existing_file(tmp_path):
     assert b"../A/01.flac" in raw
     assert b"../B/02.flac" in raw
     assert "Beyoncé".encode("latin-1") in raw
+
+
+def test_write_m3u_id_disambiguates_same_label_tracks(tmp_path):
+    """Regression (finding 1): two distinct tracks sharing one 'artist - title'
+    label keep their own paths across a degraded re-run, matched by their
+    embedded #STREAMRIP id rather than collapsing onto the first label match."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    path_a = os.path.join("..", "Album A", "01 - Intro.flac")
+    path_b = os.path.join("..", "Album B", "01 - Intro.flac")
+    # Two same-label entries, disambiguated only by their #STREAMRIP id.
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Various - Intro\n#STREAMRIP:qobuz:t1\n" + path_a + "\n"
+            "#EXTINF:-1,Various - Intro\n#STREAMRIP:qobuz:t2\n" + path_b + "\n"
+        )
+
+    # The two 'Intro' tracks don't locate this run; a third track does (so the
+    # write proceeds rather than leaving the file untouched).
+    f3 = os.path.join(str(tmp_path), "Album C", "05 - Other.flac")
+    infos = [
+        _make_info("A1", "01 - Intro", artist="Various", title="Intro",
+                   track_id="t1", position=1),
+        _make_info("A2", "01 - Intro", artist="Various", title="Intro",
+                   track_id="t2", position=2),
+        _make_info("A3", "05 - Other", artist="Various", title="Other",
+                   track_id="t3", position=3),
+    ]
+    _playlist("Mix", config)._write_m3u(infos, {3: f3}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # Each 'Intro' kept its own album path (the old label-keyed merge mapped both
+    # onto path_a, losing path_b).
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Various - Intro",
+        "#STREAMRIP:qobuz:t1",
+        path_a,
+        "#EXTINF:-1,Various - Intro",
+        "#STREAMRIP:qobuz:t2",
+        path_b,
+        "#EXTINF:-1,Various - Other",
+        "#STREAMRIP:qobuz:t3",
+        os.path.join("..", "Album C", "05 - Other.flac"),
+    ]
+
+
+def test_write_m3u_legacy_label_fallback_disambiguates_same_label(tmp_path):
+    """Regression (finding 1, legacy m3u): an existing file written before the
+    #STREAMRIP id existed still preserves two distinct same-label tracks by
+    consuming the label's existing paths in order rather than reusing the first."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    path_a = os.path.join("..", "Album A", "01 - Intro.flac")
+    path_b = os.path.join("..", "Album B", "01 - Intro.flac")
+    # No #STREAMRIP lines: two same-label entries with distinct paths.
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Various - Intro\n" + path_a + "\n"
+            "#EXTINF:-1,Various - Intro\n" + path_b + "\n"
+        )
+
+    f3 = os.path.join(str(tmp_path), "Album C", "05 - Other.flac")
+    infos = [
+        _make_info("A1", "01 - Intro", artist="Various", title="Intro",
+                   track_id="t1", position=1),
+        _make_info("A2", "01 - Intro", artist="Various", title="Intro",
+                   track_id="t2", position=2),
+        _make_info("A3", "05 - Other", artist="Various", title="Other",
+                   track_id="t3", position=3),
+    ]
+    _playlist("Mix", config)._write_m3u(infos, {3: f3}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # Distinct paths preserved in order, and each carried-over track now gains
+    # its id so a future run matches exactly.
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Various - Intro",
+        "#STREAMRIP:qobuz:t1",
+        path_a,
+        "#EXTINF:-1,Various - Intro",
+        "#STREAMRIP:qobuz:t2",
+        path_b,
+        "#EXTINF:-1,Various - Other",
+        "#STREAMRIP:qobuz:t3",
+        os.path.join("..", "Album C", "05 - Other.flac"),
+    ]
+
+
+def test_write_m3u_drops_removed_streamrip_track(tmp_path):
+    """Regression (finding 2): a track removed from the source playlist — an
+    existing #STREAMRIP entry whose id is no longer in the playlist — is dropped
+    on the next write rather than resurrected forever."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Artist A - First\n#STREAMRIP:qobuz:t1\n"
+            + os.path.join("..", "Album One", "01 - First.flac") + "\n"
+            "#EXTINF:-1,Artist B - Removed\n#STREAMRIP:qobuz:t2\n"
+            + os.path.join("..", "Album Two", "02 - Removed.flac") + "\n"
+        )
+
+    # The playlist now contains only t1 (t2 was removed); t1 locates this run.
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="Artist A", title="First",
+                      track_id="t1", position=1)
+    _playlist("Mix", config)._write_m3u([info], {1: f1}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
+        os.path.join("..", "Album One", "01 - First.flac"),
+    ]
+    # The removed track is gone, not resurrected.
+    assert "Removed" not in content
+    assert "qobuz:t2" not in content
+
+
+def test_write_m3u_preserves_foreign_entry_without_id(tmp_path):
+    """Regression (finding 2): an entry with no #STREAMRIP id (written by another
+    tool) is genuinely foreign and is still preserved — only id-bearing entries
+    absent from the playlist are dropped."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    foreign_path = os.path.join("..", "External", "foreign.flac")
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n#EXTINF:-1,Some Tool - Foreign\n" + foreign_path + "\n")
+
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="Artist A", title="First",
+                      track_id="t1", position=1)
+    _playlist("Mix", config)._write_m3u([info], {1: f1}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # The foreign entry survives (after the playlist track) and keeps no id.
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
+        os.path.join("..", "Album One", "01 - First.flac"),
+        "#EXTINF:-1,Some Tool - Foreign",
+        foreign_path,
+    ]
+
+
+def test_write_m3u_relpath_failure_falls_back_to_absolute(tmp_path):
+    """Regression (finding 3): a located file that can't be made relative to the
+    playlist folder (e.g. a different Windows drive -> os.path.relpath raises
+    ValueError) is referenced by its absolute path instead of aborting the whole
+    write after every album has already downloaded."""
+    config = _make_config(tmp_path)
+
+    abs_file = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="Artist A", title="First",
+                      track_id="t1", position=1)
+
+    with patch(
+        "streamrip.media.playlist.os.path.relpath",
+        side_effect=ValueError("path is on mount 'D:', start on mount 'C:'"),
+    ):
+        # Must not raise despite relpath failing for the located file.
+        _playlist("Mix", config)._write_m3u([info], {1: abs_file}, {})
+
+    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        "#STREAMRIP:qobuz:t1",
+        abs_file,
+    ]
 
 
 # --- helpers -----------------------------------------------------------------

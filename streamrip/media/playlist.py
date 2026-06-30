@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+from collections import deque
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -43,6 +44,11 @@ logger = logging.getLogger("streamrip")
 TRACK_RESOLVE_CHUNK = 20
 # Number of albums/singles downloaded concurrently per batch.
 DOWNLOAD_CHUNK = 5
+# Prefix of the m3u comment line that records a track's stable streamrip
+# identity (`<source>:<track_id>`). It is a comment (starts with '#'), so media
+# players ignore it, but it lets a re-run match an existing entry to its track
+# exactly instead of guessing from the `artist - title` label.
+STREAMRIP_ID_PREFIX = "#STREAMRIP:"
 
 
 @dataclass(slots=True)
@@ -254,15 +260,21 @@ class Playlist(Media):
         os.makedirs(playlist_folder, exist_ok=True)
         m3u_path = os.path.join(playlist_folder, clean_filename(self.name) + ".m3u")
 
-        # Index any existing m3u's entries by their #EXTINF label, which is a
-        # stable per-track identity (artist - title). Matching on the label —
-        # rather than the relative path — lets a track that moved on disk
-        # between runs (single -> album folder, disc-subfolder or extension
-        # change) replace its prior entry in place instead of appearing twice.
+        # Index an existing m3u's entries for cross-run carry-over. Prefer the
+        # stable streamrip id (`source:track_id`) when present: it identifies the
+        # exact track, so two tracks sharing one `artist - title` label don't
+        # collide and a track that moved on disk replaces its prior entry in
+        # place. Id-less entries (legacy m3us, or files written by another tool)
+        # fall back to label matching, consumed in order so distinct same-label
+        # tracks still keep their own paths.
         existing = self._existing_m3u_entries(m3u_path)
-        existing_by_label: dict[str, str] = {}
-        for extinf, rel in existing:
-            existing_by_label.setdefault(extinf, rel)
+        existing_by_srid: dict[str, str] = {}
+        legacy_by_label: dict[str, deque[str]] = {}
+        for extinf, srid, rel in existing:
+            if srid is not None:
+                existing_by_srid.setdefault(srid, rel)
+            else:
+                legacy_by_label.setdefault(extinf, deque()).append(rel)
 
         # Build the entries strictly in playlist order. For each track prefer the
         # file located this run; otherwise carry over its prior entry so a
@@ -270,27 +282,30 @@ class Playlist(Media):
         # dropping it or hoisting the few re-located tracks to the front.
         # `located_any` distinguishes "located nothing this run" (leave any
         # existing file untouched) from "located some" (safe to rewrite).
-        entries: list[tuple[str, str]] = []
-        seen_labels: set[str] = set()
+        entries: list[tuple[str, str | None, str]] = []
+        seen_srids: set[str] = set()
         located_any = False
         for info in infos:
+            srid = f"{info.client.source}:{info.track_id}"
             extinf = f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}"
             track_file = album_files.get(info.position)
             if track_file is None:
                 track_file = self._locate_single_file(info, resolved_singles)
             if track_file is not None:
                 located_any = True
-                rel_path = os.path.relpath(track_file, start=playlist_folder)
-            elif extinf in existing_by_label:
-                rel_path = existing_by_label[extinf]
+                rel_path = self._relpath(track_file, playlist_folder)
+            elif srid in existing_by_srid:
+                rel_path = existing_by_srid[srid]
+            elif legacy_by_label.get(extinf):
+                rel_path = legacy_by_label[extinf].popleft()
             else:
                 logger.warning(
                     f"Could not locate downloaded file for '{info.track_meta.title}'; "
                     "omitting from playlist file",
                 )
                 continue
-            entries.append((extinf, rel_path))
-            seen_labels.add(extinf)
+            entries.append((extinf, srid, rel_path))
+            seen_srids.add(srid)
 
         # Don't clobber a previously-good playlist (with a header-only stub, or a
         # mere reordering) when nothing could be located this run, e.g. a
@@ -302,22 +317,30 @@ class Playlist(Media):
             )
             return
 
-        # Preserve any foreign existing entries — ones not matching a playlist
-        # track (e.g. written by another tool) — by appending them after the
-        # playlist tracks, deduped by both label and path. This keeps the "never
-        # lose a previously-referenced track" guarantee without disturbing the
-        # playlist order above. Delete the file to force a rebuild after
-        # intentionally removing tracks.
-        seen_paths = {rel for _, rel in entries}
-        for extinf, rel in existing:
+        # Reconcile the remaining existing entries, appended after the playlist
+        # tracks so the playlist order above is undisturbed:
+        #   - A streamrip entry (has an id) whose id is no longer in the playlist
+        #     was removed from the source playlist -> drop it.
+        #   - An id-less entry (legacy, or written by another tool) is kept,
+        #     deduped by label and path, preserving the "never lose a
+        #     previously-referenced track" guarantee for genuinely foreign
+        #     content. (A legacy streamrip entry matched to a current track was
+        #     already consumed above and rewritten with its id.)
+        seen_labels = {extinf for extinf, _, _ in entries}
+        seen_paths = {rel for _, _, rel in entries}
+        for extinf, srid, rel in existing:
+            if srid is not None:
+                continue
             if extinf not in seen_labels and rel not in seen_paths:
                 seen_labels.add(extinf)
                 seen_paths.add(rel)
-                entries.append((extinf, rel))
+                entries.append((extinf, None, rel))
 
         lines = ["#EXTM3U"]
-        for extinf, rel in entries:
+        for extinf, srid, rel in entries:
             lines.append(extinf)
+            if srid is not None:
+                lines.append(STREAMRIP_ID_PREFIX + srid)
             lines.append(rel)
 
         # surrogateescape: entries carried over from an existing m3u written by
@@ -327,6 +350,24 @@ class Playlist(Media):
             f.write("\n".join(lines) + "\n")
         logger.info(f"Wrote playlist file to {m3u_path}")
         console.print(f"[green]Wrote playlist file to[/green] {m3u_path}")
+
+    @staticmethod
+    def _relpath(track_file: str, playlist_folder: str) -> str:
+        """Return `track_file` relative to `playlist_folder`.
+
+        Falls back to the absolute path (with a warning) when the two live on
+        different drives (Windows), where `os.path.relpath` raises `ValueError`:
+        the track stays referenced and playable instead of the `ValueError`
+        aborting the whole m3u write after every album has already downloaded.
+        """
+        try:
+            return os.path.relpath(track_file, start=playlist_folder)
+        except ValueError:
+            logger.warning(
+                f"Cannot relativize '{track_file}' against the playlist folder "
+                "(different drive?); referencing it by absolute path",
+            )
+            return track_file
 
     def _locate_album_files(
         self,
@@ -447,12 +488,19 @@ class Playlist(Media):
         return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
 
     @staticmethod
-    def _existing_m3u_entries(m3u_path: str) -> list[tuple[str, str]]:
-        """Parse `(#EXTINF, path)` pairs from an existing m3u (empty if absent).
+    def _existing_m3u_entries(m3u_path: str) -> list[tuple[str, str | None, str]]:
+        """Parse `(#EXTINF, streamrip-id, path)` triples from an existing m3u
+        (empty if absent).
 
         Each path line is paired with the most recent preceding `#EXTINF` line
-        (a synthesized one if a path appears without it). Used to preserve
-        previously-referenced tracks across a degraded re-run.
+        (a synthesized one if a path appears without it) and the streamrip id
+        from an immediately-preceding `#STREAMRIP:<source>:<id>` comment, if any.
+        The id (`source:track_id`, a stable per-track identity) lets a re-run
+        match an entry to its track exactly — distinguishing two tracks that
+        share an `artist - title` label, and a removed streamrip track from a
+        genuinely foreign entry. `None` for legacy entries written before the id
+        line existed (and for foreign entries written by another tool). Used to
+        merge previously-referenced tracks across a degraded re-run.
         """
         if not os.path.exists(m3u_path):
             return []
@@ -467,14 +515,19 @@ class Playlist(Media):
             logger.warning(f"Could not read existing playlist file {m3u_path}: {e}")
             return []
 
-        entries: list[tuple[str, str]] = []
+        entries: list[tuple[str, str | None, str]] = []
         pending_extinf: str | None = None
+        pending_srid: str | None = None
         for line in raw:
             if line.startswith("#EXTINF"):
                 pending_extinf = line
+                pending_srid = None
+            elif line.startswith(STREAMRIP_ID_PREFIX):
+                pending_srid = line[len(STREAMRIP_ID_PREFIX) :]
             elif line and not line.startswith("#"):
-                entries.append((pending_extinf or "#EXTINF:-1,", line))
+                entries.append((pending_extinf or "#EXTINF:-1,", pending_srid, line))
                 pending_extinf = None
+                pending_srid = None
         return entries
 
     @staticmethod
