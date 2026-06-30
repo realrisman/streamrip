@@ -54,6 +54,24 @@ def singles_folder(config: Config, source: str, album_meta: AlbumMetadata) -> st
     return os.path.join(parent, album_meta.format_folder_path(c.filepaths.folder_format))
 
 
+def disc_subfolder(
+    folder: str,
+    config: Config,
+    album_meta: AlbumMetadata,
+    track_meta: TrackMetadata,
+) -> str:
+    """Return ``folder/Disc N`` when the album spans multiple discs and disc
+    subdirectories are enabled, else ``folder`` unchanged.
+
+    Single source of truth for the album writer's disc-subfolder rule so callers
+    which need to locate a downloaded track (e.g. playlist m3u generation) stay
+    in sync with where ``PendingTrack`` actually writes multi-disc tracks.
+    """
+    if config.session.downloads.disc_subdirectories and album_meta.disctotal > 1:
+        return os.path.join(folder, f"Disc {track_meta.discnumber}")
+    return folder
+
+
 def album_folder(config: Config, source: str, album_meta: AlbumMetadata) -> str:
     """Return the folder an album's tracks are downloaded into.
 
@@ -246,11 +264,7 @@ class PendingTrack(Pending):
             )
             return None
 
-        downloads_config = self.config.session.downloads
-        if downloads_config.disc_subdirectories and self.album.disctotal > 1:
-            folder = os.path.join(self.folder, f"Disc {meta.discnumber}")
-        else:
-            folder = self.folder
+        folder = disc_subfolder(self.folder, self.config, self.album, meta)
 
         return Track(
             meta,

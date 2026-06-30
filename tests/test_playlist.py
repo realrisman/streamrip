@@ -56,6 +56,19 @@ def _make_info(
     return info
 
 
+def _make_album(folder, *, disctotal=1, track_paths=None):
+    """Build a resolved-Album stand-in.
+
+    The locator reads `album.folder` and `album.meta.disctotal` (the album-
+    endpoint truth) when a track was skipped this run, so both must be concrete.
+    """
+    album = MagicMock()
+    album.folder = folder
+    album.meta.disctotal = disctotal
+    album.track_paths = {} if track_paths is None else track_paths
+    return album
+
+
 def _playlist(name, config):
     return Playlist(name, config, MagicMock(), [], MagicMock())
 
@@ -104,7 +117,7 @@ def test_locate_album_files_fallback_globs_reconstructed_folder(tmp_path):
     # Extension differs from any assumption to prove stem-based matching.
     open(os.path.join(album_dir, "01 - First.mp3"), "w").close()
 
-    album = MagicMock(track_paths={})
+    album = _make_album(album_dir)
     info = _make_info(
         "A1", "01 - First", artist="Artist", title="First",
         position=1, album_dir="Album One",
@@ -124,7 +137,7 @@ def test_locate_album_files_honors_disc_subdirectories(tmp_path):
     os.makedirs(disc2)
     open(os.path.join(disc2, "05 - Deep Cut.flac"), "w").close()
 
-    album = MagicMock(track_paths={})
+    album = _make_album(os.path.join(str(tmp_path), "Multi Disc"), disctotal=2)
     info = _make_info(
         "A1", "05 - Deep Cut", artist="Artist", title="Deep Cut",
         disctotal=2, discnumber=2, position=1, album_dir="Multi Disc",
@@ -150,7 +163,7 @@ def test_locate_album_files_disc_scoping_avoids_cross_disc_collision(tmp_path):
     open(os.path.join(disc1, "01 - Intro.flac"), "w").close()
     open(os.path.join(disc2, "01 - Intro.flac"), "w").close()
 
-    album = MagicMock(track_paths={})
+    album = _make_album(base, disctotal=2)
     infos = [
         _make_info("A1", "01 - Intro", artist="Artist", title="Intro",
                    disctotal=2, discnumber=1, position=1, album_dir="Multi Disc"),
@@ -166,6 +179,34 @@ def test_locate_album_files_disc_scoping_avoids_cross_disc_collision(tmp_path):
         1: os.path.join(disc1, "01 - Intro.flac"),
         2: os.path.join(disc2, "01 - Intro.flac"),
     }
+
+
+def test_locate_album_files_uses_album_meta_disctotal_over_track_meta(tmp_path):
+    """Regression (finding 2): for a track skipped this run, the disc subfolder
+    is chosen from the resolved album's metadata (album-endpoint truth), not the
+    track-embedded album metadata which can understate disctotal (e.g. Deezer
+    hardcodes it to 1 for a track response)."""
+    config = _make_config(tmp_path, disc_subdirectories=True)
+
+    base = os.path.join(str(tmp_path), "Multi Disc")
+    disc2 = os.path.join(base, "Disc 2")
+    os.makedirs(disc2)
+    open(os.path.join(disc2, "05 - Deep Cut.flac"), "w").close()
+
+    # The album re-resolved this run and knows it is a 2-disc set.
+    album = _make_album(base, disctotal=2)
+    # The track-embedded album metadata understates disctotal (=1) -- the bug
+    # input. Were it used, the glob would look in the album root and miss.
+    info = _make_info(
+        "A1", "05 - Deep Cut", artist="Artist", title="Deep Cut",
+        disctotal=1, discnumber=2, position=1, album_dir="Multi Disc",
+    )
+
+    located = _playlist("Discs", config)._locate_album_files(
+        [info], {("qobuz", "A1"): album}
+    )
+
+    assert located == {1: os.path.join(disc2, "05 - Deep Cut.flac")}
 
 
 def test_locate_album_files_finds_file_when_album_absent(tmp_path):
@@ -199,8 +240,8 @@ def test_locate_album_files_omits_when_file_absent(tmp_path):
     open(os.path.join(album_one, "01 - First.flac"), "w").close()
     os.makedirs(os.path.join(str(tmp_path), "Album Three"))  # dir exists, file absent
 
-    album1 = MagicMock(track_paths={})
-    album3 = MagicMock(track_paths={})
+    album1 = _make_album(album_one)
+    album3 = _make_album(os.path.join(str(tmp_path), "Album Three"))
     infos = [
         _make_info("A1", "01 - First", artist="A", title="First",
                    position=1, album_dir="Album One"),

@@ -32,6 +32,7 @@ from .track import (
     PendingSingle,
     Track,
     album_folder,
+    disc_subfolder,
     format_track_filename,
     singles_folder,
 )
@@ -316,24 +317,33 @@ class Playlist(Media):
             if path is not None:
                 return path
 
-        # The track was skipped this run (already in the database), or its album
-        # failed to (re)resolve this run but the file exists from a prior run.
-        # Reconstruct the exact folder the album writer used and glob it by
-        # filename stem; this survives format conversion (changed extension) and
-        # does not require the album object. Scoping to the track's own disc
-        # subfolder avoids matching a same-named track on a different disc.
-        #
-        # Known limitation: for a skipped track under a custom album-derived
-        # `track_format`/`folder_format`, the stem/folder built here from the
-        # track-embedded album metadata may differ from what the album endpoint
-        # produced; the track is then re-downloaded as a single rather than
-        # mis-referenced.
+            # The track was skipped this run (already in the database) but the
+            # album still re-resolved, so glob the album's own folder by filename
+            # stem. Use the album object's folder and metadata — the album-
+            # endpoint truth the writer actually used — rather than reconstructing
+            # from the track-embedded album metadata, which can understate
+            # `disctotal` (e.g. Deezer hardcodes it to 1 for a track response)
+            # and send the glob to the album root instead of the right Disc N
+            # subfolder. Globbing survives format conversion (changed extension).
+            #
+            # Known limitation: under a custom album-derived `track_format`, the
+            # stem built here from the track-embedded metadata may differ from
+            # what the album endpoint produced; the track is then re-downloaded
+            # as a single rather than mis-referenced.
+            folder = disc_subfolder(
+                album.folder, self.config, album.meta, info.track_meta
+            )
+            return self._glob_stem(
+                folder, format_track_filename(info.track_meta, self.config)
+            )
+
+        # The album failed to (re)resolve this run, but the file may exist from a
+        # prior run. Best-effort reconstruct the folder from the track-embedded
+        # album metadata (which may understate `disctotal` / custom formats); on
+        # a miss the track falls back to a single download rather than a wrong
+        # reference.
         folder = album_folder(self.config, info.client.source, info.album_meta)
-        if (
-            self.config.session.downloads.disc_subdirectories
-            and info.album_meta.disctotal > 1
-        ):
-            folder = os.path.join(folder, f"Disc {info.track_meta.discnumber}")
+        folder = disc_subfolder(folder, self.config, info.album_meta, info.track_meta)
         return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
 
     def _locate_single_file(
