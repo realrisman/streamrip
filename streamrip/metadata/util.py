@@ -24,7 +24,9 @@ def get_album_id_from_track(source: str, track_resp) -> str | None:
     if not album:
         return None
     album_id = album.get("id")
-    return str(album_id) if album_id is not None else None
+    if not album_id:  # None, "", or 0 -> no fetchable album
+        return None
+    return str(album_id)
 
 
 def safe_get(dictionary, *keys, default=None):

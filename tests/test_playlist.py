@@ -463,3 +463,6 @@ def test_get_album_id_from_track():
     # missing/empty album object -> None.
     assert get_album_id_from_track("qobuz", {}) is None
     assert get_album_id_from_track("qobuz", {"album": {}}) is None
+    # falsy-but-present album id (empty string / 0) -> treated as no album.
+    assert get_album_id_from_track("qobuz", {"album": {"id": ""}}) is None
+    assert get_album_id_from_track("qobuz", {"album": {"id": 0}}) is None
