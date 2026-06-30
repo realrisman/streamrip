@@ -182,8 +182,12 @@ class Playlist(Media):
         `infos` are the entries that could not be located inside a downloaded
         album: album-less tracks (e.g. SoundCloud), tracks whose backing album
         failed to download, and tracks that failed inside an otherwise-
-        successful album. Downloading them as singles ensures a streamable
-        track is never lost. Returns the resolved `Track` keyed by
+        successful album. Downloading them as singles recovers these within-run
+        cases so a freshly-streamable track is never lost. (A track already in
+        the database whose file was removed out-of-band between runs is *not*
+        re-downloaded — `PendingSingle.resolve` honors the global downloaded
+        ledger, same as elsewhere in streamrip; clear the DB or use `--no-db`
+        to force a re-fetch.) Returns the resolved `Track` keyed by
         (source, track_id) so the m3u can reference the downloaded file.
         """
         return await self._dedupe_resolve_download(
@@ -250,45 +254,65 @@ class Playlist(Media):
         os.makedirs(playlist_folder, exist_ok=True)
         m3u_path = os.path.join(playlist_folder, clean_filename(self.name) + ".m3u")
 
-        # (#EXTINF, relative-path) pairs for the tracks located this run, in
-        # playlist order.
+        # Index any existing m3u's entries by their #EXTINF label, which is a
+        # stable per-track identity (artist - title). Matching on the label —
+        # rather than the relative path — lets a track that moved on disk
+        # between runs (single -> album folder, disc-subfolder or extension
+        # change) replace its prior entry in place instead of appearing twice.
+        existing = self._existing_m3u_entries(m3u_path)
+        existing_by_label: dict[str, str] = {}
+        for extinf, rel in existing:
+            existing_by_label.setdefault(extinf, rel)
+
+        # Build the entries strictly in playlist order. For each track prefer the
+        # file located this run; otherwise carry over its prior entry so a
+        # degraded re-run keeps the track (in its playlist position) rather than
+        # dropping it or hoisting the few re-located tracks to the front.
+        # `located_any` distinguishes "located nothing this run" (leave any
+        # existing file untouched) from "located some" (safe to rewrite).
         entries: list[tuple[str, str]] = []
+        seen_labels: set[str] = set()
+        located_any = False
         for info in infos:
+            extinf = f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}"
             track_file = album_files.get(info.position)
             if track_file is None:
                 track_file = self._locate_single_file(info, resolved_singles)
-            if track_file is None:
+            if track_file is not None:
+                located_any = True
+                rel_path = os.path.relpath(track_file, start=playlist_folder)
+            elif extinf in existing_by_label:
+                rel_path = existing_by_label[extinf]
+            else:
                 logger.warning(
                     f"Could not locate downloaded file for '{info.track_meta.title}'; "
                     "omitting from playlist file",
                 )
                 continue
-
-            rel_path = os.path.relpath(track_file, start=playlist_folder)
-            extinf = f"#EXTINF:-1,{info.track_meta.artist} - {info.track_meta.title}"
             entries.append((extinf, rel_path))
+            seen_labels.add(extinf)
 
-        # Don't clobber a previously-good playlist with a header-only stub when
-        # nothing could be located this run (e.g. a transient all-fail re-run).
-        if not entries:
+        # Don't clobber a previously-good playlist (with a header-only stub, or a
+        # mere reordering) when nothing could be located this run, e.g. a
+        # transient all-fail re-run; leave any existing file untouched.
+        if not located_any:
             logger.warning(
                 f"No tracks could be located for playlist '{self.name}'; "
                 "leaving any existing playlist file untouched",
             )
             return
 
-        # Never lose previously-referenced tracks. Merge this run's entries (in
-        # playlist order) with any entry already in the file whose path we did
-        # not re-locate this run, deduped by relative path. A degraded re-run
-        # (an album failed to re-resolve and the on-disk glob missed) thus keeps
-        # the old entry instead of dropping it, while newly-downloaded tracks
-        # are always added — without the old all-or-nothing skip that dropped
-        # new tracks too. Delete the file to force a rebuild after intentionally
-        # removing tracks.
-        seen = {rel for _, rel in entries}
-        for extinf, rel in self._existing_m3u_entries(m3u_path):
-            if rel not in seen:
-                seen.add(rel)
+        # Preserve any foreign existing entries — ones not matching a playlist
+        # track (e.g. written by another tool) — by appending them after the
+        # playlist tracks, deduped by both label and path. This keeps the "never
+        # lose a previously-referenced track" guarantee without disturbing the
+        # playlist order above. Delete the file to force a rebuild after
+        # intentionally removing tracks.
+        seen_paths = {rel for _, rel in entries}
+        for extinf, rel in existing:
+            if extinf not in seen_labels and rel not in seen_paths:
+                seen_labels.add(extinf)
+                seen_paths.add(rel)
                 entries.append((extinf, rel))
 
         lines = ["#EXTM3U"]

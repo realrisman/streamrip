@@ -619,6 +619,83 @@ def test_write_m3u_does_not_shrink_existing_file_on_partial_run(tmp_path):
     ]
 
 
+def test_write_m3u_preserves_order_on_degraded_rerun(tmp_path):
+    """Regression: a degraded re-run that re-locates only a middle track must
+    keep the m3u in playlist order. The old merge appended carry-over entries
+    after the located block, producing [pos2, pos1, pos3]."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Artist A - First\n"
+            + os.path.join("..", "Album One", "01 - First.flac") + "\n"
+            "#EXTINF:-1,Artist B - Second\n"
+            + os.path.join("..", "Album Two", "02 - Second.flac") + "\n"
+            "#EXTINF:-1,Artist C - Third\n"
+            + os.path.join("..", "Album Three", "03 - Third.flac") + "\n"
+        )
+
+    # Only the middle track re-locates this run; the other two fall back to
+    # their existing (carried-over) entries.
+    f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.flac")
+    infos = [
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
+        _make_info("A3", "03 - Third", artist="Artist C", title="Third", position=3),
+    ]
+    _playlist("Mix", config)._write_m3u(infos, {2: f2}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        os.path.join("..", "Album One", "01 - First.flac"),
+        "#EXTINF:-1,Artist B - Second",
+        os.path.join("..", "Album Two", "02 - Second.flac"),
+        "#EXTINF:-1,Artist C - Third",
+        os.path.join("..", "Album Three", "03 - Third.flac"),
+    ]
+
+
+def test_write_m3u_no_duplicate_when_track_relocates(tmp_path):
+    """Regression: a track that moved on disk between runs (e.g. single -> album
+    folder) must replace its prior entry, not appear twice. The old path-keyed
+    dedup left both the stale single path and the new album path."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    # Prior run referenced the track as a single in the downloads root.
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(
+            "#EXTM3U\n"
+            "#EXTINF:-1,Artist A - First\n"
+            + os.path.join("..", "Some Single.flac") + "\n"
+        )
+
+    # This run locates the same track (same artist/title) inside its album.
+    new_file = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="Artist A", title="First", position=1)
+    _playlist("Mix", config)._write_m3u([info], {1: new_file}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # Exactly one entry, pointing at the new album path; the stale single is gone.
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        os.path.join("..", "Album One", "01 - First.flac"),
+    ]
+
+
 def test_write_m3u_adds_new_tracks_during_degraded_run(tmp_path):
     """Regression (finding 1): a newly-added track that downloaded successfully
     this run must appear in the m3u even when the run is degraded (some old
