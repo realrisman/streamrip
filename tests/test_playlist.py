@@ -2,19 +2,28 @@ import os
 from unittest.mock import MagicMock
 
 from streamrip.media.playlist import Playlist
-from streamrip.media.track import format_track_filename
+from streamrip.media.track import format_track_filename, singles_folder
 from streamrip.metadata.util import get_album_id_from_track
 
 
-def _make_config(tmp_path, *, disc_subdirectories=False):
+def _make_config(
+    tmp_path,
+    *,
+    disc_subdirectories=False,
+    add_singles_to_folder=False,
+    source_subdirectories=False,
+):
     config = MagicMock()
     fp = config.session.filepaths
     fp.track_format = "{tracknumber} - {title}"
     fp.restrict_characters = False
     fp.truncate_to = 0
+    fp.add_singles_to_folder = add_singles_to_folder
+    fp.folder_format = "{albumartist} - {album}"
     dl = config.session.downloads
     dl.folder = str(tmp_path)
     dl.disc_subdirectories = disc_subdirectories
+    dl.source_subdirectories = source_subdirectories
     return config
 
 
@@ -158,6 +167,81 @@ def test_write_m3u_references_singles_for_album_less_tracks(tmp_path):
         "#EXTINF:-1,Some Artist - Loose Track",
         os.path.join("..", "Some Artist", "Loose Track.flac"),
     ]
+
+
+def test_write_m3u_single_rerun_fallback_globs_existing_file(tmp_path):
+    """An album-less single already on disk (skipped this run because it is in
+    the database) is still referenced by globbing its destination folder."""
+    config = _make_config(tmp_path)  # add_singles_to_folder False -> downloads root
+
+    open(os.path.join(str(tmp_path), "Loose Track.flac"), "w").close()
+
+    info = _make_info(
+        None, "Loose Track", artist="Some Artist", title="Loose Track",
+        track_id="sc1",
+    )
+
+    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
+    # resolved_singles is empty: the single was not (re)downloaded this run.
+    playlist._write_m3u([info], {}, {})
+
+    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Some Artist - Loose Track",
+        os.path.join("..", "Loose Track.flac"),
+    ]
+
+
+def test_write_m3u_album_failure_falls_back_to_single(tmp_path):
+    """A track whose backing album failed to download is referenced via the
+    single it was downloaded as instead of being dropped."""
+    config = _make_config(tmp_path)
+
+    single_file = os.path.join(str(tmp_path), "Fallback Track.flac")
+    open(single_file, "w").close()
+    track = MagicMock(download_path=single_file)
+
+    # album_id is set, but the album is absent from resolved_albums (failed).
+    info = _make_info(
+        "A1", "Fallback Track", artist="Artist", title="Fallback Track",
+        track_id="t9",
+    )
+
+    playlist = Playlist("Mix", config, MagicMock(), [], MagicMock())
+    playlist._write_m3u([info], {}, {"t9": track})
+
+    with open(os.path.join(str(tmp_path), "playlist", "Mix.m3u"), encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist - Fallback Track",
+        os.path.join("..", "Fallback Track.flac"),
+    ]
+
+
+def test_singles_folder_without_add_singles_to_folder(tmp_path):
+    config = _make_config(tmp_path, add_singles_to_folder=False)
+    album_meta = MagicMock()
+
+    # Goes straight into the downloads root; album metadata is not consulted.
+    assert singles_folder(config, "qobuz", album_meta) == str(tmp_path)
+    album_meta.format_folder_path.assert_not_called()
+
+
+def test_singles_folder_with_add_singles_and_source_subdirs(tmp_path):
+    config = _make_config(
+        tmp_path, add_singles_to_folder=True, source_subdirectories=True
+    )
+    album_meta = MagicMock()
+    album_meta.format_folder_path.return_value = "Artist - Album"
+
+    assert singles_folder(config, "qobuz", album_meta) == os.path.join(
+        str(tmp_path), "Qobuz", "Artist - Album"
+    )
 
 
 def test_get_album_id_from_track():

@@ -40,6 +40,8 @@ class TestErrorHandling:
         with patch.object(
             Playlist, "_download_albums", AsyncMock(return_value={})
         ) as mock_download_albums, patch.object(
+            Playlist, "_download_singles", AsyncMock(return_value={})
+        ) as mock_download_singles, patch.object(
             Playlist, "_write_m3u"
         ) as mock_write_m3u:
             await playlist.download()
@@ -48,6 +50,7 @@ class TestErrorHandling:
         mock_track_failure.resolve.assert_called_once()
         # The surviving track's info is forwarded despite the other failing.
         mock_download_albums.assert_called_once_with([good_info])
+        mock_download_singles.assert_called_once_with([good_info], {})
         mock_write_m3u.assert_called_once()
 
     @pytest.mark.asyncio

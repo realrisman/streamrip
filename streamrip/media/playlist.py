@@ -28,7 +28,7 @@ from ..metadata.util import get_album_id_from_track
 from ..utils.ssl_utils import get_aiohttp_connector_kwargs
 from .album import Album, PendingAlbum
 from .media import Media, Pending
-from .track import PendingSingle, Track, format_track_filename
+from .track import PendingSingle, Track, format_track_filename, singles_folder
 
 logger = logging.getLogger("streamrip")
 
@@ -121,9 +121,10 @@ class Playlist(Media):
             return
 
         # Phase B: download each distinct album once (full album), plus any
-        # album-less tracks (e.g. SoundCloud) as singles.
+        # album-less tracks (e.g. SoundCloud) as singles. Tracks whose album
+        # failed to download also fall back to a single download.
         resolved_albums = await self._download_albums(infos)
-        resolved_singles = await self._download_singles(infos)
+        resolved_singles = await self._download_singles(infos, resolved_albums)
 
         # Phase C: write an m3u that references the tracks inside their album
         # folders (which live outside the `playlist` folder).
@@ -189,16 +190,21 @@ class Playlist(Media):
     async def _download_singles(
         self,
         infos: list[PlaylistTrackInfo],
+        resolved_albums: dict[str, Album],
     ) -> dict[str, Track]:
-        """Download album-less playlist tracks (e.g. SoundCloud) as singles.
+        """Download playlist tracks as singles.
 
-        Returns the resolved `Track` per track id so the m3u can reference the
+        Covers album-less tracks (e.g. SoundCloud) and tracks whose backing
+        album failed to download, so a streamable track is never lost. Returns
+        the resolved `Track` per track id so the m3u can reference the
         downloaded file directly.
         """
         # Dedupe by track id, keeping the first client seen for each track.
+        # A track needs a single download when it has no album, or when its
+        # album could not be downloaded.
         unique: dict[str, Client] = {}
         for info in infos:
-            if info.album_id is not None:
+            if info.album_id is not None and info.album_id in resolved_albums:
                 continue
             unique.setdefault(info.track_id, info.client)
 
@@ -272,28 +278,40 @@ class Playlist(Media):
         resolved_singles: dict[str, Track],
     ) -> str | None:
         """Return the path of the downloaded file for a playlist entry, or None."""
-        # Album-less track downloaded as a single: use the resolved Track's path.
-        if info.album_id is None:
-            track = resolved_singles.get(info.track_id)
-            return track.download_path if track is not None else None
-
-        album = resolved_albums.get(info.album_id)
+        album = (
+            resolved_albums.get(info.album_id) if info.album_id is not None else None
+        )
+        # No backing album (album-less, or the album failed to download): the
+        # track was fetched as a single.
         if album is None:
-            return None
+            return self._locate_single_file(info, resolved_singles)
 
-        # The track lives inside the downloaded album folder. Glob for the
-        # filename stem so the match survives format conversion (changed
-        # extension) and re-runs where the file already exists.
-        expected_dir = album.folder
-        downloads_config = self.config.session.downloads
-        if downloads_config.disc_subdirectories and info.album_meta.disctotal > 1:
-            expected_dir = os.path.join(
-                expected_dir,
-                f"Disc {info.track_meta.discnumber}",
-            )
-
+        # The track lives inside the downloaded album folder. Glob recursively
+        # for the filename stem so the match is found regardless of any disc
+        # subdirectory, and survives format conversion (changed extension) and
+        # re-runs where the file already exists.
         stem = format_track_filename(info.track_meta, self.config)
-        pattern = os.path.join(glob.escape(expected_dir), glob.escape(stem) + ".*")
+        pattern = os.path.join(
+            glob.escape(album.folder), "**", glob.escape(stem) + ".*"
+        )
+        matches = glob.glob(pattern, recursive=True)
+        return matches[0] if matches else None
+
+    def _locate_single_file(
+        self,
+        info: PlaylistTrackInfo,
+        resolved_singles: dict[str, Track],
+    ) -> str | None:
+        """Return the path of a single-downloaded track for a playlist entry."""
+        track = resolved_singles.get(info.track_id)
+        if track is not None:
+            return track.download_path
+
+        # The single was skipped this run (already in the database). Glob its
+        # destination folder so the m3u still references the existing file.
+        folder = singles_folder(self.config, info.client.source, info.album_meta)
+        stem = format_track_filename(info.track_meta, self.config)
+        pattern = os.path.join(glob.escape(folder), glob.escape(stem) + ".*")
         matches = glob.glob(pattern)
         return matches[0] if matches else None
 
