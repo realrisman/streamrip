@@ -465,6 +465,95 @@ def test_write_m3u_does_not_clobber_existing_file_when_nothing_located(tmp_path)
         assert f.read() == good_contents
 
 
+def test_write_m3u_does_not_shrink_existing_file_on_partial_run(tmp_path):
+    """A degraded re-run that locates fewer tracks than the existing m3u already
+    holds must keep the existing (more complete) file rather than truncating
+    it."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    good_contents = (
+        "#EXTM3U\n"
+        "#EXTINF:-1,Artist A - First\n../Album One/01.flac\n"
+        "#EXTINF:-1,Artist B - Second\n../Album Two/02.flac\n"
+        "#EXTINF:-1,Artist C - Third\n../Album Three/03.flac\n"
+    )
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write(good_contents)
+
+    # Only one of three tracks could be located this run.
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    infos = [
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
+        _make_info("A3", "03 - Third", artist="Artist C", title="Third", position=3),
+    ]
+    _playlist("Mix", config)._write_m3u(infos, {1: f1}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        assert f.read() == good_contents
+
+
+def test_write_m3u_overwrites_when_not_shrinking(tmp_path):
+    """When the new run locates at least as many tracks as the existing file,
+    the m3u is rewritten (growth/refresh is allowed)."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    with open(m3u_path, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n#EXTINF:-1,Old - Only\n../Old/01.flac\n")
+
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    f2 = os.path.join(str(tmp_path), "Album Two", "02 - Second.mp3")
+    infos = [
+        _make_info("A1", "01 - First", artist="Artist A", title="First", position=1),
+        _make_info("A2", "02 - Second", artist="Artist B", title="Second", position=2),
+    ]
+    _playlist("Mix", config)._write_m3u(infos, {1: f1, 2: f2}, {})
+
+    with open(m3u_path, encoding="utf-8") as f:
+        content = f.read()
+
+    assert content.splitlines() == [
+        "#EXTM3U",
+        "#EXTINF:-1,Artist A - First",
+        os.path.join("..", "Album One", "01 - First.flac"),
+        "#EXTINF:-1,Artist B - Second",
+        os.path.join("..", "Album Two", "02 - Second.mp3"),
+    ]
+
+
+def test_write_m3u_handles_non_utf8_existing_file(tmp_path):
+    """Reading an existing m3u that isn't UTF-8 (e.g. written by another tool)
+    must not raise UnicodeDecodeError and abort the write after albums have
+    already downloaded."""
+    config = _make_config(tmp_path)
+
+    playlist_folder = os.path.join(str(tmp_path), "playlist")
+    os.makedirs(playlist_folder)
+    m3u_path = os.path.join(playlist_folder, "Mix.m3u")
+    # latin-1 bytes (accented name) — invalid UTF-8; two #EXTINF entries.
+    with open(m3u_path, "wb") as f:
+        f.write(
+            "#EXTM3U\n#EXTINF:-1,Beyoncé - One\n../A/01.flac\n"
+            "#EXTINF:-1,Sigur Rós - Two\n../B/02.flac\n".encode("latin-1")
+        )
+
+    # Only one track locates this run -> never-shrink keeps the existing file.
+    f1 = os.path.join(str(tmp_path), "Album One", "01 - First.flac")
+    info = _make_info("A1", "01 - First", artist="A", title="First", position=1)
+
+    # Must not raise; existing (2 entries) > located (1) -> keep existing.
+    _playlist("Mix", config)._write_m3u([info], {1: f1}, {})
+
+    with open(m3u_path, "rb") as f:
+        assert "Beyoncé".encode("latin-1") in f.read()
+
+
 # --- helpers -----------------------------------------------------------------
 
 

@@ -270,10 +270,24 @@ class Playlist(Media):
 
         # Don't clobber a previously-good playlist with a header-only stub when
         # nothing could be located this run (e.g. a transient all-fail re-run).
-        if len(lines) == 1:
+        located = sum(1 for ln in lines if ln.startswith("#EXTINF"))
+        if located == 0:
             logger.warning(
                 f"No tracks could be located for playlist '{self.name}'; "
                 "leaving any existing playlist file untouched",
+            )
+            return
+
+        # Never auto-shrink: a degraded re-run (some albums failed to re-resolve
+        # and the on-disk glob missed) must not overwrite a more-complete m3u
+        # with fewer entries. The user can delete the file to force a rebuild
+        # after intentionally removing tracks.
+        existing = self._existing_m3u_entry_count(m3u_path)
+        if existing > located:
+            logger.warning(
+                f"Located fewer tracks ({located}) than the existing playlist "
+                f"file ({existing}) for '{self.name}'; keeping the existing "
+                "file. Delete it to force a rebuild.",
             )
             return
 
@@ -365,6 +379,21 @@ class Playlist(Media):
         # destination folder so the m3u still references the existing file.
         folder = singles_folder(self.config, info.client.source, info.album_meta)
         return self._glob_stem(folder, format_track_filename(info.track_meta, self.config))
+
+    @staticmethod
+    def _existing_m3u_entry_count(m3u_path: str) -> int:
+        """Number of `#EXTINF` track entries in an existing m3u (0 if absent)."""
+        if not os.path.exists(m3u_path):
+            return 0
+        try:
+            # errors="replace": an existing m3u written by another tool may not
+            # be UTF-8; a decode error here must not abort the whole write. The
+            # `#EXTINF` marker is ASCII, so counting is unaffected.
+            with open(m3u_path, encoding="utf-8", errors="replace") as f:
+                return sum(1 for line in f if line.startswith("#EXTINF"))
+        except OSError as e:
+            logger.warning(f"Could not read existing playlist file {m3u_path}: {e}")
+            return 0
 
     @staticmethod
     def _glob_stem(folder: str, stem: str) -> str | None:
