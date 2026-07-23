@@ -12,13 +12,17 @@ class TestErrorHandling:
 
     @pytest.mark.asyncio
     async def test_playlist_handles_failed_track(self):
-        """Test that a playlist download continues even if one track fails."""
+        """A failure resolving one playlist track must not abort the playlist.
+
+        The remaining (successfully resolved) tracks should still be passed on
+        to the album-download and m3u-writing phases.
+        """
         mock_config = MagicMock()
         mock_client = MagicMock()
 
+        good_info = MagicMock()
         mock_track_success = MagicMock()
-        mock_track_success.resolve = AsyncMock(return_value=MagicMock())
-        mock_track_success.resolve.return_value.rip = AsyncMock()
+        mock_track_success.resolve = AsyncMock(return_value=good_info)
 
         mock_track_failure = MagicMock()
         mock_track_failure.resolve = AsyncMock(
@@ -30,13 +34,28 @@ class TestErrorHandling:
             config=mock_config,
             client=mock_client,
             tracks=[mock_track_success, mock_track_failure],
+            db=MagicMock(),
         )
 
-        await playlist.download()
+        with patch.object(
+            Playlist, "_download_albums", AsyncMock(return_value={})
+        ) as mock_download_albums, patch.object(
+            Playlist, "_locate_album_files", return_value={}
+        ) as mock_locate, patch.object(
+            Playlist, "_download_singles", AsyncMock(return_value={})
+        ) as mock_download_singles, patch.object(
+            Playlist, "_write_m3u"
+        ) as mock_write_m3u:
+            await playlist.download()
 
         mock_track_success.resolve.assert_called_once()
-        mock_track_success.resolve.return_value.rip.assert_called_once()
         mock_track_failure.resolve.assert_called_once()
+        # The surviving track's info is forwarded despite the other failing.
+        mock_download_albums.assert_called_once_with([good_info])
+        mock_locate.assert_called_once_with([good_info], {})
+        # Nothing located in an album -> the survivor falls back to a single.
+        mock_download_singles.assert_called_once_with([good_info])
+        mock_write_m3u.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_album_handles_failed_track(self):

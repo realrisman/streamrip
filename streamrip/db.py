@@ -31,6 +31,18 @@ class DatabaseInterface(ABC):
     def all(self) -> list:
         pass
 
+    def set_path(self, item_id: str, path: str):
+        """Record the on-disk path a downloaded item was written to.
+
+        Optional capability: only the ``downloads`` table persists paths. The
+        default is a no-op so tables that don't track paths (and the no-DB
+        ``Dummy``) remain valid implementations.
+        """
+
+    def get_path(self, item_id: str) -> str | None:
+        """Return the recorded on-disk path for ``item_id``, or None."""
+        return None
+
 
 class Dummy(DatabaseInterface):
     """This exists as a mock to use in case databases are disabled."""
@@ -49,6 +61,12 @@ class Dummy(DatabaseInterface):
 
     def all(self):
         return []
+
+    def set_path(self, *_):
+        pass
+
+    def get_path(self, _):
+        return None
 
 
 class DatabaseBase(DatabaseInterface):
@@ -159,12 +177,47 @@ class DatabaseBase(DatabaseInterface):
 
 
 class Downloads(DatabaseBase):
-    """A table that stores the downloaded IDs."""
+    """A table that stores the downloaded IDs.
+
+    A companion ``download_paths`` table maps each downloaded id to the final
+    on-disk path it was written to. This lets later runs (e.g. playlist m3u
+    generation) reference the exact file a previous run produced instead of
+    re-discovering it by reconstructing folders and globbing.
+    """
 
     name = "downloads"
     structure: Final[dict] = {
         "id": ["text", "unique"],
     }
+    paths_table: Final[str] = "download_paths"
+
+    def __init__(self, path: str):
+        super().__init__(path)
+        # Created idempotently for both fresh and pre-existing databases (the
+        # `downloads` table itself is left untouched, so `all()`'s row shape and
+        # the `rip db` display are unaffected). Rows are absent for ids
+        # downloaded before this table existed, in which case `get_path`
+        # returns None and the caller falls back to its legacy lookup.
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.paths_table} "
+                "(id TEXT PRIMARY KEY, path TEXT)"
+            )
+
+    def set_path(self, item_id: str, path: str):
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                f"INSERT OR REPLACE INTO {self.paths_table} (id, path) VALUES (?, ?)",
+                (str(item_id), path),
+            )
+
+    def get_path(self, item_id: str) -> str | None:
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                f"SELECT path FROM {self.paths_table} WHERE id=?",
+                (str(item_id),),
+            ).fetchone()
+        return row[0] if row else None
 
 
 class Failed(DatabaseBase):
@@ -186,8 +239,14 @@ class Database:
     def downloaded(self, item_id: str) -> bool:
         return self.downloads.contains(id=item_id)
 
-    def set_downloaded(self, item_id: str):
+    def set_downloaded(self, item_id: str, path: str | None = None):
         self.downloads.add((item_id,))
+        if path is not None:
+            self.downloads.set_path(item_id, path)
+
+    def path_for(self, item_id: str) -> str | None:
+        """Return the on-disk path a previous run recorded for ``item_id``."""
+        return self.downloads.get_path(item_id)
 
     def get_failed_downloads(self) -> list[tuple[str, str, str]]:
         return self.failed.all()

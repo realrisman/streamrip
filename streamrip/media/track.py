@@ -8,7 +8,7 @@ from ..client import Client, Downloadable
 from ..config import Config
 from ..db import Database
 from ..exceptions import NonStreamableError
-from ..filepath_utils import clean_filename
+from ..filepath_utils import clean_filename, clean_filepath
 from ..metadata import AlbumMetadata, Covers, TrackMetadata, tag_file
 from ..progress import add_title, get_progress_callback, remove_title
 from .artwork import download_artwork
@@ -19,6 +19,75 @@ logger = logging.getLogger("streamrip")
 
 # Total download attempts per track (1 initial + retries) before giving up.
 MAX_DOWNLOAD_RETRIES = 3
+
+
+def format_track_filename(meta: TrackMetadata, config: Config) -> str:
+    """Return the cleaned, truncated track filename (without extension).
+
+    This is the single source of truth for a track's on-disk filename stem so
+    that callers which need to locate a downloaded file (e.g. playlist m3u
+    generation) stay in sync with what ``Track`` actually writes.
+    """
+    c = config.session.filepaths
+    name = clean_filename(
+        meta.format_track_path(c.track_format),
+        restrict=c.restrict_characters,
+    )
+    if c.truncate_to > 0 and len(name) > c.truncate_to:
+        name = name[: c.truncate_to]
+    return name
+
+
+def singles_folder(config: Config, source: str, album_meta: AlbumMetadata) -> str:
+    """Return the folder a single track is downloaded into.
+
+    Single source of truth for ``PendingSingle``'s destination so that callers
+    which need to locate a single's file (e.g. playlist m3u generation) stay in
+    sync with what ``PendingSingle`` actually writes.
+    """
+    c = config.session
+    parent = c.downloads.folder
+    if not c.filepaths.add_singles_to_folder:
+        return parent
+    if c.downloads.source_subdirectories:
+        parent = os.path.join(parent, source.capitalize())
+    return os.path.join(parent, album_meta.format_folder_path(c.filepaths.folder_format))
+
+
+def disc_subfolder(
+    folder: str,
+    config: Config,
+    album_meta: AlbumMetadata,
+    track_meta: TrackMetadata,
+) -> str:
+    """Return ``folder/Disc N`` when the album spans multiple discs and disc
+    subdirectories are enabled, else ``folder`` unchanged.
+
+    Single source of truth for the album writer's disc-subfolder rule so callers
+    which need to locate a downloaded track (e.g. playlist m3u generation) stay
+    in sync with where ``PendingTrack`` actually writes multi-disc tracks.
+    """
+    if config.session.downloads.disc_subdirectories and album_meta.disctotal > 1:
+        return os.path.join(folder, f"Disc {track_meta.discnumber}")
+    return folder
+
+
+def album_folder(config: Config, source: str, album_meta: AlbumMetadata) -> str:
+    """Return the folder an album's tracks are downloaded into.
+
+    Single source of truth for ``PendingAlbum``'s destination so that callers
+    which need to locate an album track's file (e.g. playlist m3u generation)
+    can reconstruct the exact folder the album writer used.
+    """
+    c = config.session
+    parent = c.downloads.folder
+    if c.downloads.source_subdirectories:
+        parent = os.path.join(parent, source.capitalize())
+    folder = clean_filepath(
+        album_meta.format_folder_path(c.filepaths.folder_format),
+        c.filepaths.restrict_characters,
+    )
+    return os.path.join(parent, folder)
 
 
 @dataclass(slots=True)
@@ -128,7 +197,10 @@ class Track(Media):
         if self.config.session.conversion.enabled:
             await self._convert()
 
-        self.db.set_downloaded(self.meta.info.id)
+        # Record the final path (post-conversion, so the extension is correct)
+        # so later runs can reference this exact file by id instead of
+        # reconstructing the folder and globbing for it.
+        self.db.set_downloaded(self.meta.info.id, self.download_path)
 
     async def _convert(self):
         c = self.config.session.conversion
@@ -143,15 +215,7 @@ class Track(Media):
         self.download_path = engine.final_fn  # because the extension changed
 
     def _set_download_path(self):
-        c = self.config.session.filepaths
-        formatter = c.track_format
-        track_path = clean_filename(
-            self.meta.format_track_path(formatter),
-            restrict=c.restrict_characters,
-        )
-        if c.truncate_to > 0 and len(track_path) > c.truncate_to:
-            track_path = track_path[: c.truncate_to]
-
+        track_path = format_track_filename(self.meta, self.config)
         self.download_path = os.path.join(
             self.folder,
             f"{track_path}.{self.downloadable.extension}",
@@ -203,11 +267,7 @@ class PendingTrack(Pending):
             )
             return None
 
-        downloads_config = self.config.session.downloads
-        if downloads_config.disc_subdirectories and self.album.disctotal > 1:
-            folder = os.path.join(self.folder, f"Disc {meta.discnumber}")
-        else:
-            folder = self.folder
+        folder = disc_subfolder(self.folder, self.config, self.album, meta)
 
         return Track(
             meta,
@@ -276,11 +336,7 @@ class PendingSingle(Pending):
         config = self.config.session
         quality = getattr(config, self.client.source).quality
         assert isinstance(quality, int)
-        parent = config.downloads.folder
-        if config.filepaths.add_singles_to_folder:
-            folder = self._format_folder(album)
-        else:
-            folder = parent
+        folder = singles_folder(self.config, self.client.source, album)
 
         os.makedirs(folder, exist_ok=True)
 
@@ -299,15 +355,6 @@ class PendingSingle(Pending):
             quality,
             is_single=True,
         )
-
-    def _format_folder(self, meta: AlbumMetadata) -> str:
-        c = self.config.session
-        parent = c.downloads.folder
-        formatter = c.filepaths.folder_format
-        if c.downloads.source_subdirectories:
-            parent = os.path.join(parent, self.client.source.capitalize())
-
-        return os.path.join(parent, meta.format_folder_path(formatter))
 
     async def _download_cover(self, covers: Covers, folder: str) -> str | None:
         embed_path, _ = await download_artwork(

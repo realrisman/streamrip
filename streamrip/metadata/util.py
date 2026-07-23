@@ -9,6 +9,26 @@ def get_album_track_ids(source: str, resp) -> list[str]:
     return [track["id"] for track in tracklist]
 
 
+def get_album_id_from_track(source: str, track_resp) -> str | None:
+    """Return the fetchable album id for the album a track belongs to.
+
+    The album id embedded in a track's metadata is the value that the album
+    endpoint accepts (e.g. for Qobuz this is the UPC-style ``album.id``, not the
+    internal ``qobuz_id`` that ``AlbumMetadata`` exposes). Returns None when the
+    source has no separate album (SoundCloud) or the track carries no album
+    object, in which case the track is downloaded as a single instead.
+    """
+    if source == "soundcloud":
+        return None
+    album = track_resp.get("album") if isinstance(track_resp, dict) else None
+    if not album:
+        return None
+    album_id = album.get("id")
+    if not album_id:  # None, "", or 0 -> no fetchable album
+        return None
+    return str(album_id)
+
+
 def safe_get(dictionary, *keys, default=None):
     return functools.reduce(
         lambda d, key: d.get(key, default) if isinstance(d, dict) else default,
