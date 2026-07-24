@@ -30,11 +30,19 @@ class Album(Media):
     # the download produced instead of re-discovering it by globbing. Tracks
     # skipped (already in the database) are absent and located by other means.
     track_paths: dict[str, str] = field(default_factory=dict)
+    # Keep fully-downloaded albums resolved so callers can still use their
+    # metadata and folder, while making rip() free of filesystem/network work.
+    skip_download: bool = False
 
     async def preprocess(self):
+        if self.skip_download:
+            return
         progress.add_title(self.meta.album)
 
     async def download(self):
+        if self.skip_download:
+            return
+
         async def _resolve_and_download(pending: Pending):
             try:
                 track = await pending.resolve()
@@ -55,6 +63,8 @@ class Album(Media):
                 logger.error(f"Album track processing error: {result}")
 
     async def postprocess(self):
+        if self.skip_download:
+            return
         progress.remove_title(self.meta.album)
 
 
@@ -87,15 +97,26 @@ class PendingAlbum(Pending):
             return None
 
         tracklist = get_album_track_ids(self.client.source, resp)
-        album_dir = album_folder(self.config, self.client.source, meta)
-        os.makedirs(album_dir, exist_ok=True)
-        embed_cover, _ = await download_artwork(
-            self.client.session,
-            album_dir,
-            meta.covers,
-            self.config.session.artwork,
-            for_playlist=False,
+        skip_download = bool(tracklist) and all(
+            self.db.downloaded(track_id) for track_id in tracklist
         )
+        if skip_download:
+            logger.info(
+                f"Skipping album {self.id}. All tracks are marked as downloaded "
+                "in the database.",
+            )
+
+        album_dir = album_folder(self.config, self.client.source, meta)
+        embed_cover = None
+        if not skip_download:
+            os.makedirs(album_dir, exist_ok=True)
+            embed_cover, _ = await download_artwork(
+                self.client.session,
+                album_dir,
+                meta.covers,
+                self.config.session.artwork,
+                for_playlist=False,
+            )
         pending_tracks = [
             PendingTrack(
                 id,
@@ -109,4 +130,11 @@ class PendingAlbum(Pending):
             for id in tracklist
         ]
         logger.debug("Pending tracks: %s", pending_tracks)
-        return Album(meta, pending_tracks, self.config, album_dir, self.db)
+        return Album(
+            meta,
+            pending_tracks,
+            self.config,
+            album_dir,
+            self.db,
+            skip_download=skip_download,
+        )
