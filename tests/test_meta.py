@@ -24,8 +24,7 @@ def test_album_metadata_qobuz():
     assert m.album == "Rumours"
     assert m.albumartist == "Fleetwood Mac"
     assert m.year == "1977"
-    assert "Pop" in m.genre
-    assert "Rock" in m.genre
+    assert m.genre == ["Rock"]
     assert not m.covers.empty()
 
     assert m.albumcomposer == "Various Composers"
@@ -43,6 +42,14 @@ def test_album_metadata_qobuz():
     assert m.lyrics is None
     assert m.purchase_date is None
     assert m.tracktotal == 11
+
+
+def test_album_metadata_qobuz_falls_back_to_genres_list():
+    resp = {**qobuz_album_resp, "genre": {}}
+
+    m = AlbumMetadata.from_qobuz(resp)
+
+    assert m.genre == ["Pop", "Rock"]
 
 
 def test_track_metadata_qobuz():
